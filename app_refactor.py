@@ -61,7 +61,7 @@ CLICK_TOLERANCE_DEGREES = 0.0001
 MISSING_VALUE_TOKENS = {"nan", "nat", "none", "natype"}
 
 # Local LLM API Configuration
-OLLAMA_MODEL = "phi3"
+OLLAMA_MODEL = "llama3.2:3b"
 
 # ==========================================
 # 2. DATA PROCESSING PIPELINE
