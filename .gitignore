@@ -28,15 +28,15 @@ Thumbs.db
 desktop.ini
 
 # Data files (Uncomment below to ignore all data files)
-# *.csv
-# *.xlsx
-# *.xls
-# *.json
-# *.parquet
+*.csv
+*.xlsx
+*.xls
+*.json
+*.parquet
 
 # Ignore specific large files in this directory (Optional)
-# List of Local Grants-in-Aid Projects from CY 2023-2025 (Davao Region).xlsx
-# test.csv
+List of Local Grants-in-Aid Projects from CY 2023-2025 (Davao Region).xlsx
+test.csv
 
 # Logs
 *.log
