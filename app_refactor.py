@@ -1097,7 +1097,7 @@ if uploaded_file is not None:
     map_data = st_folium(
         project_map,
         use_container_width=True,
-        height=450,
+        height=460,
         returned_objects=["last_object_clicked"],
     )
 
