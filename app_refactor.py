@@ -978,7 +978,7 @@ def ask_ai_about_data(client, df, user_query, chat_history):
     {csv_data}
 
     Here is the recent conversation history:
-    {history_text}
+    {history_text} 
 
     User Query: {user_query}
 
