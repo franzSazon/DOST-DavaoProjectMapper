@@ -1,0 +1,14 @@
+[theme]
+# Cyan blue 
+primaryColor = "#00AEEF"
+
+# White background for the main screen
+backgroundColor = "#FFFFFF"
+
+# Pure Black for the sidebar (Streamlit auto-inverts text to white here)
+secondaryBackgroundColor = "#222d32" 
+
+# Base text color (Applies to main screen)
+textColor = "#000000"
+
+font = "sans serif"
