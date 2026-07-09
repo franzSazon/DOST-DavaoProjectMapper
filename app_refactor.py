@@ -1027,8 +1027,7 @@ def ask_ai_about_data(ollama_url, df, user_query, chat_history):
     Based ONLY on the provided CSV data and the conversation history, answer the user's query.
     Be concise and professional, avoid using emdashes and just be functional with your tone.
 
-    Use markdown to format your response in a neat way using bullets, 
-    highlighting and headers, do not use h1 or h2, only use h4 if you want to use a header.
+    Use markdown to format your response in a neat way using bullets and highlighting, do not use headers.
     """
 
     payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
