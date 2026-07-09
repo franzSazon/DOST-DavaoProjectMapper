@@ -13,8 +13,8 @@ import folium
 from folium.features import DivIcon
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
-from google import genai
 import io
+import requests
 import time
 import tempfile
 try:
@@ -60,11 +60,8 @@ CLICK_TOLERANCE_DEGREES = 0.0001
 
 MISSING_VALUE_TOKENS = {"nan", "nat", "none", "natype"}
 
-# The new google-genai SDK requires a client instance rather than a
-# module-level configure() call; GEMINI_MODEL centralizes the model name
-# so it's only defined in one place.
-GEMINI_MODEL = "gemini-2.5-flash-lite"
-
+# Local LLM API Configuration
+OLLAMA_MODEL = "phi3"
 
 # ==========================================
 # 2. DATA PROCESSING PIPELINE
@@ -919,78 +916,124 @@ def handle_map_click(map_data, filtered_df):
         show_project_details(clicked_projects)
 
 # ==========================================
-# 9. AI ASSISTANT & Q&A LOGIC
+# 9. AI ASSISTANT & Q&A LOGIC (LOCAL PRIVACY VIA OLLAMA)
 # ==========================================
-def get_gemini_client():
+
+def get_ollama_url():
     """
-    Return a cached Gemini client if an API key is configured, else None.
+    Retrieve the active Ngrok tunnel link from Streamlit secrets.
 
-    The new google-genai SDK is client-based rather than using a
-    module-level genai.configure() call, so the client is created once
-    and cached in session_state for reuse across reruns.
+    Returns the string URL if configured, otherwise returns None.
+    This replaces the previous get_gemini_client method to ensure
+    absolute data privacy locally on your hardware.
     """
-    if "gemini_client" not in st.session_state:
-        if "GEMINI_API_KEY" in st.secrets:
-            st.session_state["gemini_client"] = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-        else:
-            st.session_state["gemini_client"] = None
-
-    return st.session_state["gemini_client"]
+    if "OLLAMA_URL" in st.secrets:
+        return st.secrets["OLLAMA_URL"]
+    return None
 
 
-def generate_executive_summary(client, df):
-    """Generate a stakeholder-ready executive summary of the filtered project data."""
+def generate_executive_summary(ollama_url, df):
+    """Generate a stakeholder-ready executive summary using the local Phi-3 model."""
     clean_df = format_export_data(df)
-    csv_data = clean_df.to_csv(index=False)
+    
+    # Generate high-level summary statistics to avoid context-overflow
+    total_projects = len(clean_df)
+    status_counts = clean_df['Status'].value_counts().to_dict() if 'Status' in clean_df.columns else {}
+    
+    # Attempt to find a funding column to sum
+    funding_col = next((c for c in clean_df.columns if 'fund' in c.lower() or 'cost' in c.lower() or 'amount' in c.lower()), None)
+    total_funding = 0
+    if funding_col:
+        total_funding = pd.to_numeric(clean_df[funding_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').sum()
+
+    div_col = next((c for c in clean_df.columns if 'div' in c.lower() or 'unit' in c.lower()), None)
+    div_counts = clean_df[div_col].value_counts().to_dict() if div_col else {}
+
+    summary_text = f"""
+    Total Projects: {total_projects}
+    Projects by Status: {status_counts}
+    Total Funding: Php {total_funding:,.2f}
+    Projects by Division: {div_counts}
+    """
 
     prompt = f"""
     You are the Chief Data Strategist for DOST-Davao. But do not start or open with saying that you are a chief data strategist.
 
-    Based ONLY on the following filtered regional project data, write a highly professional,
+    Based ONLY on the following summary of regional project data, write a highly professional,
     2-paragraph executive summary of the current spatial status.
 
     Focus on highlighting key funding allocations, division focus, and overall project health (Ongoing vs Completed vs Terminated).
     Do not use external knowledge.
 
-    Data:
-    {csv_data}
+    Data Summary:
+    {summary_text}
     """
 
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+
+    # Crucial headers to bypass Ngrok free-tier interceptor page
+    headers = {
+        "Content-Type": "application/json",
+        "ngrok-skip-browser-warning": "true",
+    }
+
     try:
-        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        return response.text
+        response = requests.post(
+            f"{ollama_url}/api/generate", json=payload, headers=headers, timeout=600
+        )
+        response.raise_for_status()
+        return response.json().get("response", "No response generated.")
     except Exception as e:
-        return f"⚠️ Error generating summary: {str(e)}"
+        return f"⚠️ Error generating local summary: {str(e)}"
 
 
-def ask_ai_about_data(client, df, user_query, chat_history):
-    """Answer a natural-language question about the filtered data, with conversational memory."""
+def ask_ai_about_data(ollama_url, df, user_query, chat_history):
+    """Answer natural-language data questions using the local Phi-3 instance with conversation history."""
     clean_df = format_export_data(df)
-    csv_data = clean_df.to_csv(index=False)
+    
+    # Limit rows to avoid huge prompt payloads that slow down local models
+    MAX_ROWS = 50
+    sample_df = clean_df.head(MAX_ROWS)
+    csv_data = sample_df.to_csv(index=False)
+    
+    row_notice = ""
+    if len(clean_df) > MAX_ROWS:
+        row_notice = f"(Note: The data has been truncated to the top {MAX_ROWS} rows out of {len(clean_df)} to improve AI speed. Summarize based on this sample.)"
 
-    # Format previous chat history so the AI remembers the context of the conversation
-    history_text = "\n".join([f"{msg['role'].capitalize()}: {msg['content']}" for msg in chat_history])
+    # Format historical turns for context mapping
+    history_text = "\n".join(
+        [f"{msg['role'].capitalize()}: {msg['content']}" for msg in chat_history]
+    )
 
     prompt = f"""
     You are an AI data assistant for the DOST-Davao Regional Office.
-    Here is the currently filtered DOST project data in CSV format:
+    Here is the currently filtered DOST project data in CSV format {row_notice}:
 
     {csv_data}
-
-    Here is the recent conversation history:
-    {history_text} 
 
     User Query: {user_query}
 
     Based ONLY on the provided CSV data and the conversation history, answer the user's query.
-    Be concise, professional, and use Markdown for formatting (bolding, bullet points, etc.).
+    Be concise and professional, avoid using emdashes and just be functional with your tone.
+
+    Use markdown to format your response in a neat way using bullets, highlighting and headers.
     """
 
+    payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+
+    headers = {
+        "Content-Type": "application/json",
+        "ngrok-skip-browser-warning": "true",
+    }
+
     try:
-        response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
-        return response.text
+        response = requests.post(
+            f"{ollama_url}/api/generate", json=payload, headers=headers, timeout=600
+        )
+        response.raise_for_status()
+        return response.json().get("response", "No response generated.")
     except Exception as e:
-        return f"⚠️ Error communicating with AI: {str(e)}"
+        return f"⚠️ Error communicating with Local AI: {str(e)}"
 
 # ==========================================
 # 10. MAP EXPORT & BRANDING
@@ -1121,8 +1164,8 @@ if uploaded_file is not None:
     with head_col1:
         st.markdown("### 🗾 DOST-Davao Project Mapper AI")
     
-    gemini_client = get_gemini_client()
-    if gemini_client:
+    ollama_url = get_ollama_url()
+    if ollama_url:
         with head_col2:
             if st.button("🗑️ Clear Chat", width="stretch"):
                 st.session_state.chat_messages = [
@@ -1132,7 +1175,7 @@ if uploaded_file is not None:
 
         if st.button("📊 Generate Executive Summary for Current Map", width="stretch"):
             with st.spinner("Drafting executive summary..."):
-                summary = generate_executive_summary(gemini_client, filtered_df)
+                summary = generate_executive_summary(ollama_url, filtered_df)
                 st.info(summary)
         
         st.caption("Ask natural language questions about the projects currently visible on the map.")
@@ -1173,7 +1216,7 @@ if uploaded_file is not None:
             # 2. Get the AI response
             with st.chat_message("assistant"):
                 with st.spinner("Analyzing map data..."):
-                    ai_response = ask_ai_about_data(gemini_client, filtered_df, prompt, st.session_state.chat_messages)
+                    ai_response = ask_ai_about_data(ollama_url, filtered_df, prompt, st.session_state.chat_messages)
                     st.markdown(ai_response)
             
             # 3. Append both to session state
@@ -1181,7 +1224,7 @@ if uploaded_file is not None:
             st.session_state.chat_messages.append({"role": "assistant", "content": ai_response})
 
     else:
-        st.error("🔑 Gemini API key not found. Please add GEMINI_API_KEY to your `.streamlit/secrets.toml` file.")
+        st.error("🔑 Ollama URL not found. Please add OLLAMA_URL to your `.streamlit/secrets.toml` file.")
 
 else:
     st.info("Upload the raw Excel file in the sidebar to begin.")
