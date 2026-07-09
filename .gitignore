@@ -40,3 +40,6 @@ test.csv
 
 # Logs
 *.log
+
+# Old app versions
+app_v2.py
