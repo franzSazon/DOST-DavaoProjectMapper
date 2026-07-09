@@ -956,17 +956,28 @@ def generate_executive_summary(ollama_url, df):
     Projects by Division: {div_counts}
     """
 
+    # Limit rows to avoid huge prompt payloads that slow down local models
+    MAX_ROWS = 50
+    sample_df = clean_df.head(MAX_ROWS)
+    csv_data = sample_df.to_csv(index=False)
+    
+    row_notice = ""
+    if len(clean_df) > MAX_ROWS:
+        row_notice = f"(Note: The CSV data below has been truncated to the top {MAX_ROWS} rows out of {len(clean_df)} to improve AI speed. Use the Data Summary above for accurate totals.)"
+
     prompt = f"""
-    You are the Chief Data Strategist for DOST-Davao. But do not start or open with saying that you are a chief data strategist.
-
-    Based ONLY on the following summary of regional project data, write a highly professional,
-    2-paragraph executive summary of the current spatial status.
-
+    Please write a 2-paragraph executive summary based ONLY on the following regional project data summary and CSV sample.
     Focus on highlighting key funding allocations, division focus, and overall project health (Ongoing vs Completed vs Terminated).
     Do not use external knowledge.
 
-    Data Summary:
+    Use markdown to format your response neatly using bullets, highlighting, and headers. 
+    Do not use h1 (#) or h2 (##) headers, only use h3 (###) if you want to use a header.
+
+    Data Summary (Use these for overall totals):
     {summary_text}
+
+    CSV Data Sample {row_notice}:
+    {csv_data}
     """
 
     payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
