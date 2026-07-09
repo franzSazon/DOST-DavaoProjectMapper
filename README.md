@@ -28,4 +28,4 @@ The DOST-Davao Project Mapper is a Streamlit application designed to ingest, pro
 *   Streamlit
 *   Pandas
 *   Folium
-*   Google GenAI SDK
+*   Ollama local LLM (phi3)
