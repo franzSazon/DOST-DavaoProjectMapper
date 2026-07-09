@@ -971,7 +971,7 @@ def generate_executive_summary(ollama_url, df):
     Do not use external knowledge.
 
     Use markdown to format your response neatly using bullets, highlighting, and headers. 
-    Do not use h1 (#) or h2 (##) headers, only use h3 (###) if you want to use a header.
+    Do not use h1 (#) or h2 (##) headers, only use h4 (####) if you want to use a header.
 
     Data Summary (Use these for overall totals):
     {summary_text}
@@ -1028,7 +1028,7 @@ def ask_ai_about_data(ollama_url, df, user_query, chat_history):
     Be concise and professional, avoid using emdashes and just be functional with your tone.
 
     Use markdown to format your response in a neat way using bullets, 
-    highlighting and headers, do not use h1 or h2, only use h3 if you want to use a header.
+    highlighting and headers, do not use h1 or h2, only use h4 if you want to use a header.
     """
 
     payload = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
