@@ -8,7 +8,7 @@ The DOST-Davao Project Mapper is a Streamlit application designed to ingest, pro
 *   **Interactive Mapping:** Displays project locations on an interactive map using Folium, allowing users to visually navigate project distributions.
 *   **Filterable KPIs:** Provides key performance indicators and filtering options to analyze projects by status, division, and other relevant metrics.
 *   **Detailed Project Views:** Allows users to select individual projects on the map to view specific details and status updates.
-*   **AI Integration:** Utilizes Google's Gemini models for advanced data processing or summarization tasks within the application.
+*   **AI Integration:** Utilizes Ollama's llama3.2:3b for advanced data processing or summarization tasks within the application.
 
 ## Installation and Setup
 
@@ -28,4 +28,4 @@ The DOST-Davao Project Mapper is a Streamlit application designed to ingest, pro
 *   Streamlit
 *   Pandas
 *   Folium
-*   Ollama local LLM (phi3)
+*   Ollama local LLM (llama3.2:3b)
