@@ -516,10 +516,12 @@ def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
     fields the rest of the app relies on (numeric Lat/Long, a single
     display status, a single effective funding figure).
 
-    The app tracks the map, not a general project database: rows without
-    parseable coordinates are dropped here so every KPI, filter, table row,
-    and export downstream reflects exactly what's plotted on the map.
-    Rows without status simply display as 'Unknown'.
+    Rows without parseable coordinates are kept here (not dropped) --
+    they're the candidates for the "Resolve Missing Coordinates" geocoding
+    step in the sidebar. The app still only maps/tracks KPIs for rows that
+    end up with coordinates; that filtering happens later, after geocoding
+    has had a chance to fill gaps in. Rows without status simply display
+    as 'Unknown'.
 
     In Legacy Tracker mode, every CEST/LGIA/SSCP sheet is combined (they
     are genuinely different divisions). In Cost List / Any Template mode,
@@ -541,15 +543,159 @@ def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
 
     combined["Lat"] = pd.to_numeric(combined["Lat"], errors="coerce")
     combined["Long"] = pd.to_numeric(combined["Long"], errors="coerce")
-    combined = combined.dropna(subset=["Lat", "Long"])
-
-    if combined.empty:
-        return combined
-
     combined["Map_Status"] = combined.apply(_assign_map_status, axis=1)
     combined[EFFECTIVE_FUNDING_COL] = combined.apply(_compute_effective_funding, axis=1)
 
     return combined
+
+
+# ==========================================
+# 2.5 GEOCODING ENGINE (MAPBOX)
+# ==========================================
+# Task 7.1: Provider Setup & Security
+# ------------------------------------
+# Requires a Mapbox access token stored in .streamlit/secrets.toml:
+#   MAPBOX_API_KEY = "pk.xxxxxxxx"
+# Never hardcode the token in source. If it's missing, geocoding is
+# disabled in the UI (see Task 7.4) rather than the app crashing.
+MAPBOX_GEOCODING_URL = "https://api.mapbox.com/geocoding/v5/mapbox.places/{query}.json"
+GEOCODE_REGION_CONTEXT = "Davao Region, Philippines"
+GEOCODE_COUNTRY_CODE = "ph"
+# (min_lon, min_lat, max_lon, max_lat) -- covers Davao del Norte, Davao del
+# Sur, Davao Oriental, Davao de Oro, and Davao Occidental with a small
+# buffer. Used both as a hard Mapbox `bbox` filter and as a client-side
+# sanity check on whatever comes back, so a fuzzy agency-name match in
+# Luzon or Visayas gets rejected instead of silently plotted.
+DAVAO_REGION_BBOX = (125.0, 5.5, 126.7, 8.1)  # min_lon, min_lat, max_lon, max_lat
+
+
+def get_mapbox_token():
+    """Read the Mapbox token from Streamlit secrets. Returns None (rather
+    than raising) if it isn't configured, so the caller can degrade
+    gracefully instead of crashing the whole app."""
+    try:
+        return st.secrets.get("MAPBOX_API_KEY")
+    except Exception:
+        return None
+
+
+# Task 7.2: Address Contextualization Logic
+# ------------------------------------------
+def build_geocode_query(row):
+    """Build a search string for the geocoder out of whatever location
+    signal a row actually has. Prefers 'Implementing Agency' (which also
+    covers 'Implementing Partner' -- both map to this canonical field) since
+    that's a searchable organization/site name, and falls back to 'Location'
+    only if no agency/partner is recorded. Appends the region context so a
+    bare name like 'DOST XI Regional Office' resolves to somewhere in Davao
+    Region instead of matching globally."""
+    agency = clean_missing(row.get("Implementing Agency", ""), fallback="")
+    location = clean_missing(row.get("Location", ""), fallback="")
+
+    base = None
+    if agency:
+        base = agency
+    elif location:
+        base = location
+
+    if not base:
+        return None
+
+    base = base.strip()
+    if "davao" not in base.lower() and "philippines" not in base.lower():
+        base = f"{base}, {GEOCODE_REGION_CONTEXT}"
+
+    return base
+
+
+# Task 7.3: Cached Fetching & Rate Limit Handling
+# -------------------------------------------------
+@st.cache_data(show_spinner=False)
+def geocode_address_mapbox(query, api_token):
+    """Resolve one query string to (lat, long) via the Mapbox Geocoding
+    API. Cached by (query, token) so a query already resolved this
+    session never re-hits the API -- important both for cost and for
+    respecting rate limits on repeated runs over the same dataset.
+
+    Results are hard-constrained to DAVAO_REGION_BBOX (both via Mapbox's
+    own `bbox` parameter and a client-side re-check) so a fuzzy match on
+    an agency/office name common across the Philippines -- e.g. multiple
+    unrelated offices sharing a generic name -- can't resolve to a
+    same-named place in Luzon or Visayas. Returns None on any failure (no
+    match, out-of-region match, network error, bad response) so the
+    caller can add it to the manual-review fallback list."""
+    if not query or not api_token:
+        return None
+
+    min_lon, min_lat, max_lon, max_lat = DAVAO_REGION_BBOX
+    url = MAPBOX_GEOCODING_URL.format(query=requests.utils.quote(query))
+    params = {
+        "access_token": api_token,
+        "limit": 1,
+        "country": GEOCODE_COUNTRY_CODE,
+        "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+        "proximity": f"{DAVAO_CENTER[1]},{DAVAO_CENTER[0]}",  # Mapbox wants lon,lat
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        return None
+    finally:
+        # Gentle throttle -- well within Mapbox's free-tier rate limits,
+        # just avoids hammering the API on large batches.
+        time.sleep(0.1)
+
+    features = data.get("features") or []
+    if not features:
+        return None
+
+    # Mapbox returns [longitude, latitude].
+    lon, lat = features[0]["center"]
+
+    # Belt-and-suspenders: reject anything outside the region even if the
+    # bbox param somehow let it through (e.g. an older Mapbox dataset
+    # ignoring bbox for an exact-name hit).
+    if not (min_lon <= lon <= max_lon and min_lat <= lat <= max_lat):
+        return None
+
+    return (lat, lon)
+
+
+def resolve_missing_coordinates(df, api_token):
+    """Task 7.4 core loop (UI lives in the sidebar, see MAIN APPLICATION
+    LOGIC): geocode every row missing Lat/Long in place. Returns the
+    updated df plus a list of rows that couldn't be resolved, so DOST
+    staff can review them manually rather than the app silently dropping
+    them."""
+    df = df.copy()
+    missing_mask = df["Lat"].isna() | df["Long"].isna()
+    missing_idx = df[missing_mask].index.tolist()
+
+    failures = []
+    progress = st.sidebar.progress(0, text="Resolving coordinates...")
+
+    for i, idx in enumerate(missing_idx):
+        row = df.loc[idx]
+        query = build_geocode_query(row)
+        coords = geocode_address_mapbox(query, api_token) if query else None
+
+        if coords:
+            df.at[idx, "Lat"] = coords[0]
+            df.at[idx, "Long"] = coords[1]
+        else:
+            failures.append({
+                "Project Title": row.get("Project Title", "Untitled"),
+                "Division": row.get("Division", ""),
+                "Query Used": query or "(no Location or Implementing Agency to search)",
+            })
+
+        progress.progress((i + 1) / len(missing_idx), text=f"Resolving {i + 1}/{len(missing_idx)}...")
+
+    progress.empty()
+    return df, failures
 
 
 # ==========================================
@@ -580,6 +726,41 @@ def _build_badge_html(abbrev, hex_color):
     """
 
 
+_ABBREV_STOPWORDS = {"of", "the", "and", "for", "in", "to", "a", "an", "on", "at", "&"}
+
+
+def derive_project_abbreviation(title, max_letters=6):
+    """Build a short badge label out of a project's title when no
+    'Name Abbreviation' was supplied by the source file -- initials of the
+    significant words, e.g. 'Community-Based Skills Training Program' ->
+    'CBSTP'. Falls back to the first few letters of the title itself if it
+    can't extract multiple words, and to 'N/A' if there's no title at all."""
+    if not isinstance(title, str) or not title.strip():
+        return "N/A"
+
+    words = re.findall(r"[A-Za-z0-9]+", title)
+    significant = [w for w in words if w.lower() not in _ABBREV_STOPWORDS] or words
+    if not significant:
+        return "N/A"
+
+    if len(significant) == 1:
+        return significant[0][:max_letters].upper()
+
+    return "".join(w[0].upper() for w in significant[:max_letters])
+
+
+def get_marker_label(row):
+    """Return the badge label to render on the map: the source file's own
+    'Name Abbreviation' when it actually has one, otherwise an abbreviation
+    derived from the Project Title. This is what fixes newly-geocoded
+    projects (and any Cost List / Any Template row) showing up as a blank
+    or 'nan' badge on the map."""
+    raw = row.get("Name Abbreviation")
+    if pd.notna(raw) and str(raw).strip():
+        return str(raw).strip()
+    return derive_project_abbreviation(row.get("Project Title"))
+
+
 def create_map(df):
     """Render the Davao region map with a clustered marker per project.
     Rows without coordinates (e.g. from a source file that has no
@@ -590,7 +771,7 @@ def create_map(df):
     mappable_df = df.dropna(subset=["Lat", "Long"])
 
     for _, row in mappable_df.iterrows():
-        abbrev = str(row.get("Name Abbreviation", "DOST Project"))
+        abbrev = get_marker_label(row)
         division = str(row.get("Division", "N/A"))
         hex_color = DIVISION_COLORS.get(division, DEFAULT_MARKER_COLOR)
 
@@ -884,40 +1065,53 @@ st.markdown("""
         }
 
         /* ==========================================
-           12. SIDEBAR ELEMENTS COLOR FIX
+           12. SIDEBAR ELEMENTS COLOR FIX (multiselect / selectbox)
            ========================================== */
-        .st-emotion-cache-yiekhv {
+        /* The previous version of this fix targeted Streamlit's
+           auto-generated .st-emotion-cache-* / .st-XX class names, captured
+           from a browser inspector at one point in time. Those hashes come
+           from Emotion (CSS-in-JS) and are NOT stable across Streamlit
+           versions or even separate rebuilds -- which is exactly why the
+           filter widgets intermittently reverted to an unstyled white
+           background that blended into the page. BaseWeb (the underlying
+           component library Streamlit's select/multiselect widgets are
+           built on) instead exposes `data-baseweb` attributes that don't
+           change with the build hash, so we target those.
+        */
+
+        /* The select/multiselect input box itself: keep it a crisp white
+           box so it reads clearly against the dark sidebar, regardless of
+           which internal class names this Streamlit build happens to use. */
+        [data-testid="stSidebar"] [data-baseweb="select"] > div {
             background-color: #FFFFFF !important;
-        }
-
-        .st-f3 {
-            background-color: transparent !important;
-        }
-
-        .st-fg {
-            background-color: #FFFFFF !important;
-        }
-
-        .st-emotion-cache-ps3p8x .stTooltipHoverTarget svg.icon {
-            stroke: #FFFFFF !important;
-            stroke-width: 2.25 !important;
-        }
-
-        .st-fg {
-            background-color: #222d32 !important;
-        }
-
-        .st-ge {
             border-color: #FFFFFF !important;
         }
-
-        .st-f3 {
-            background-color: #FFFFFF !important;
+        [data-testid="stSidebar"] [data-baseweb="select"] input {
+            color: #2C3E50 !important;
         }
 
-        .st-hu {
-            padding-left: 0.75rem !important;
+        /* Selected-value "pills" inside multiselect widgets (e.g. the
+           Division / Status filters) */
+        [data-testid="stSidebar"] [data-baseweb="tag"] {
+            background-color: #00AEEF !important;
+            color: #FFFFFF !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="tag"] span {
+            color: #FFFFFF !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="tag"] svg {
+            fill: #FFFFFF !important;
+        }
+
+        /* The dropdown options list renders in a portal at the document
+           root, not nested inside the sidebar, so it needs its own
+           (unscoped) selector rather than [data-testid="stSidebar"] ... */
+        [data-baseweb="popover"] [data-baseweb="menu"] {
             background-color: #FFFFFF !important;
+        }
+        [data-baseweb="popover"] [data-baseweb="menu"] li,
+        [data-baseweb="popover"] [data-baseweb="menu"] li * {
+            color: #2C3E50 !important;
         }
 
         /* ==========================================
@@ -1078,7 +1272,7 @@ def show_export_dialog(df):
             marker_cluster = MarkerCluster().add_to(export_map)
 
             for _, row in df.dropna(subset=["Lat", "Long"]).iterrows():
-                abbrev = str(row.get("Name Abbreviation", "DOST Project"))
+                abbrev = get_marker_label(row)
                 division = str(row.get("Division", "N/A"))
                 hex_color = DIVISION_COLORS.get(division, DEFAULT_MARKER_COLOR)
 
@@ -1252,7 +1446,7 @@ def render_filters(clean_df):
             if len(date_range) == 2:
                 start_dt = pd.to_datetime(date_range[0])
                 end_dt = pd.to_datetime(date_range[1])
-                filtered_approval_dates = pd.to_datetime(filtered_df[DATE_APPROVED_COL], errors="coerce")
+                filtered_approval_dates = pd.to_datetime(filtered_df[DATE_APPROVED_COL], errors="coerce", format="mixed")
                 
                 date_mask = (filtered_approval_dates >= start_dt) & (filtered_approval_dates <= end_dt)
                 if include_missing_dates:
@@ -1261,7 +1455,7 @@ def render_filters(clean_df):
                 filtered_df = filtered_df[date_mask]
             elif len(date_range) == 1:
                 start_dt = pd.to_datetime(date_range[0])
-                filtered_approval_dates = pd.to_datetime(filtered_df[DATE_APPROVED_COL], errors="coerce")
+                filtered_approval_dates = pd.to_datetime(filtered_df[DATE_APPROVED_COL], errors="coerce", format="mixed")
                 
                 date_mask = (filtered_approval_dates >= start_dt)
                 if include_missing_dates:
@@ -1614,15 +1808,81 @@ if uploaded_file is not None:
 
     if clean_df.empty:
         st.error(
-            "⚠️ No projects with usable coordinates were found in this file "
-            f"under the **{data_format_label}** setting. The map only tracks "
-            "projects that have Lat/Long (or a Coordinates column) -- if "
-            "this file lacks location data, try a different sheet or "
-            "Data Format option in the sidebar."
+            f"⚠️ No recognizable project data found in this file under the "
+            f"**{data_format_label}** setting. If this is a different layout, "
+            "try switching the Data Format option or the sheet/snapshot picker "
+            "in the sidebar."
         )
         st.stop()
 
-    filtered_df = render_filters(clean_df)
+    # Persist a working copy across reruns (keyed to this exact file/mode/
+    # sheet combination) so geocoded coordinates survive button clicks and
+    # other widget interactions instead of resetting every rerun.
+    dataset_key = (
+        getattr(uploaded_file, "name", None),
+        getattr(uploaded_file, "size", None),
+        ingestion_mode,
+        selected_sheet,
+    )
+    if st.session_state.get("_dataset_key") != dataset_key:
+        st.session_state["_dataset_key"] = dataset_key
+        st.session_state["working_df"] = clean_df.copy()
+        st.session_state["geocode_failures"] = []
+
+    working_df = st.session_state["working_df"]
+    missing_coords_count = int((working_df["Lat"].isna() | working_df["Long"].isna()).sum())
+
+    st.sidebar.divider()
+    st.sidebar.subheader("📍 Missing Coordinates")
+    if missing_coords_count == 0:
+        st.sidebar.caption("Every project has coordinates.")
+    else:
+        st.sidebar.caption(
+            f"{missing_coords_count} project(s) have no Lat/Long yet and won't "
+            "appear on the map or in KPIs until resolved."
+        )
+        mapbox_token = get_mapbox_token()
+        if not mapbox_token:
+            st.sidebar.warning(
+                "Mapbox isn't configured yet. Add `MAPBOX_API_KEY` to "
+                "`.streamlit/secrets.toml` to enable this."
+            )
+        elif st.sidebar.button(f"📍 Resolve Missing Coordinates ({missing_coords_count})"):
+            updated_df, failures = resolve_missing_coordinates(working_df, mapbox_token)
+            st.session_state["working_df"] = updated_df
+            st.session_state["geocode_failures"] = failures
+            working_df = updated_df
+
+            resolved_count = missing_coords_count - len(failures)
+            if failures:
+                st.sidebar.warning(f"✅ Resolved {resolved_count}. ⚠️ {len(failures)} need manual review.")
+            else:
+                st.sidebar.success(f"✅ All {resolved_count} coordinate(s) resolved!")
+
+    if st.session_state.get("geocode_failures"):
+        with st.sidebar.expander(f"⚠️ Needs Manual Review ({len(st.session_state['geocode_failures'])})"):
+            st.dataframe(
+                pd.DataFrame(st.session_state["geocode_failures"]),
+                width="stretch",
+                hide_index=True,
+            )
+            st.caption(
+                "These couldn't be automatically geocoded. Add coordinates "
+                "manually in the source file, or refine the Location / "
+                "Implementing Agency text and re-run."
+            )
+
+    mappable_df = working_df.dropna(subset=["Lat", "Long"])
+
+    if mappable_df.empty:
+        st.error(
+            "⚠️ No projects with usable coordinates yet. Use "
+            "**📍 Resolve Missing Coordinates** in the sidebar, or check that "
+            "this file/sheet actually has location data."
+        )
+        st.stop()
+
+    filtered_df = render_filters(mappable_df)
     render_kpi_scorecards(filtered_df)
 
     project_map = create_map(filtered_df)
