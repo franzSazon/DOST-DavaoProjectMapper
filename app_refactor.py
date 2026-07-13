@@ -915,6 +915,11 @@ st.markdown("""
             background-color: #FFFFFF !important;
         }
 
+        .st-hu {
+            padding-left: 0.75rem !important;
+            background-color: #FFFFFF !important;
+        }
+
         /* ==========================================
            13. SLIDER TWEAKS
            ========================================== */
