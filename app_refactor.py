@@ -898,6 +898,23 @@ st.markdown("""
             background-color: #FFFFFF !important;
         }
 
+        .st-emotion-cache-ps3p8x .stTooltipHoverTarget svg.icon {
+            stroke: #FFFFFF !important;
+            stroke-width: 2.25 !important;
+        }
+
+        .st-fg {
+            background-color: #222d32 !important;
+        }
+
+        .st-ge {
+            border-color: #FFFFFF !important;
+        }
+
+        .st-f3 {
+            background-color: #FFFFFF !important;
+        }
+
         /* ==========================================
            13. SLIDER TWEAKS
            ========================================== */
