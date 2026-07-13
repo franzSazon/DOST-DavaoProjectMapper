@@ -132,8 +132,8 @@ OLLAMA_MODEL = "llama3.2:3b"
 # nothing downstream needs to know or care which shape the source file was.
 
 INGESTION_MODES = {
-    "Legacy Tracker (per-division sheet tabs)": "legacy",
-    "Cost List / Any Template (auto-detect)": "auto",
+    "Division-Based Template": "legacy",
+    "General Template": "auto",
 }
 
 
@@ -1103,13 +1103,13 @@ data_format_label = st.sidebar.radio(
     options=list(INGESTION_MODES.keys()),
     index=0,
     help=(
-        "Legacy Tracker expects the original per-division sheet tabs "
-        "(CEST/LGIA/SSCP) with TRUE/FALSE status rows and a Coordinates "
-        "column. Cost List / Any Template scans every sheet and auto-detects "
-        "the layout (section-divided, tracker-style, or flat), and works "
-        "with files that have no status column. Either way, only projects "
-        "with usable coordinates will show up -- the map is the source of "
-        "truth for everything else in the app."
+        "Select the option that matches your Excel file.\n\n"
+        "• Division-Based Template – For files organized into separate "
+        "CEST, LGIA, and SSCP worksheets.\n\n"
+        "• General Template – For project lists, project cost reports, "
+        "and other supported DOST Excel templates. The application will "
+        "automatically recognize the file format.\n\n"
+        "Note: Only projects with valid coordinates can be displayed on the map."
     ),
 )
 ingestion_mode = INGESTION_MODES[data_format_label]
@@ -1128,14 +1128,13 @@ if uploaded_file is not None and ingestion_mode == "auto":
         selected_sheet = candidate_sheets[0]
     else:
         selected_sheet = st.sidebar.selectbox(
-            "Select Snapshot/Sheet:",
+            "Select Worksheet:",
             options=candidate_sheets,
             index=len(candidate_sheets) - 1,
             help=(
-                "This workbook has more than one sheet that looks like a valid "
-                "project list -- often dated snapshots of the same projects "
-                "rather than separate divisions. Pick the one to load; they "
-                "won't be combined automatically to avoid double-counting."
+                "This workbook contains multiple worksheets.\n\n"
+                "Select the worksheet you want to display. "
+                "Only the selected worksheet will be loaded and shown on the map."
             ),
         )
 
@@ -1592,11 +1591,11 @@ if uploaded_file is not None:
 
     if clean_df.empty:
         st.error(
-            "⚠️ No projects with usable coordinates were found in this file "
-            f"under the **{data_format_label}** setting. The map only tracks "
-            "projects that have Lat/Long (or a Coordinates column) -- if "
-            "this file lacks location data, try a different sheet or "
-            "Data Format option in the sidebar."
+            f"⚠️ No projects with valid coordinates were found in this file under the "
+            f"**{data_format_label}** setting. The map only displays projects with "
+            f"latitude and longitude information (or a Coordinates column). If this "
+            f"file does not contain location data, try selecting a different worksheet "
+            f"or a different Data Format in the sidebar."
         )
         st.stop()
 
