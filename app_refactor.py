@@ -135,7 +135,10 @@ INGESTION_MODES = {
     "Division-Based Template": "legacy",
     "General Template": "auto",
 }
+<<<<<<< HEAD
 
+=======
+>>>>>>> 377714d600e0645afde87abb5929f0b11189bc5a
 
 def clean_header_text(v):
     return re.sub(r"\s+", " ", str(v)).strip().lower() if v is not None else ""
@@ -493,6 +496,7 @@ def process_workbook(uploaded_file, sheet_filter=None):
 
 
 @st.cache_data
+<<<<<<< HEAD
 def list_candidate_sheets(uploaded_file):
     """Return every VISIBLE sheet name in the workbook that has a
     recognizable project-list header row. Used to build the snapshot/sheet
@@ -523,6 +527,20 @@ def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
     has had a chance to fill gaps in. Rows without status simply display
     as 'Unknown'.
 
+=======
+def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
+    """Ingest the workbook under the chosen mode and finish deriving the
+    fields the rest of the app relies on (numeric Lat/Long, a single
+    display status, a single effective funding figure).
+
+    Rows without parseable coordinates are kept here (not dropped) --
+    they're the candidates for the "Resolve Missing Coordinates" geocoding
+    step in the sidebar. The app still only maps/tracks KPIs for rows that
+    end up with coordinates; that filtering happens later, after geocoding
+    has had a chance to fill gaps in. Rows without status simply display
+    as 'Unknown'.
+
+>>>>>>> 377714d600e0645afde87abb5929f0b11189bc5a
     In Legacy Tracker mode, every CEST/LGIA/SSCP sheet is combined (they
     are genuinely different divisions). In Cost List / Any Template mode,
     only `selected_sheet` is loaded -- a workbook in this format is often
