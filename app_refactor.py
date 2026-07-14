@@ -66,21 +66,19 @@ OLLAMA_MODEL = "llama3.2:3b"
 # ==========================================
 # 2. DATA PROCESSING PIPELINE
 # ==========================================
-def process_sheet(xls, sheet_name):
-    """
-    Read one division sheet and collapse its multi-row project blocks into
-    one record per project, with one-hot status columns and parsed
-    coordinates.
+# This engine is template-agnostic: it detects the header row, maps
+# whatever headers exist to FIELD_ALIASES, figures out per-sheet whether
+# projects are laid out as multi-row status blocks ("merged_status" - the
+# original tracker format), section-delimited single rows ("section_headers"
+# - the new print-style cost list, where a bare row like "CEST PROGRAM"
+# marks a division boundary instead of a separate sheet), or already flat
+# one-row-per-project ("flat"). All three converge on OUTPUT_SCHEMA so
+# nothing downstream needs to know or care which shape the source file was.
 
-    Returns an empty DataFrame if the sheet doesn't match the expected
-    format (e.g. an intro or cover sheet).
-    """
-    df = pd.read_excel(xls, sheet_name=sheet_name, header=1, dtype=str)
-    df.columns = [str(col).strip() for col in df.columns]
-    original_cols = list(df.columns)
-
-    if STATUS_BOOL_COL not in original_cols:
-        return pd.DataFrame()
+INGESTION_MODES = {
+    "Division-Based Template": "legacy",
+    "General Template": "auto",
+}
 
     status_idx = original_cols.index(STATUS_BOOL_COL)
     status_label_col = original_cols[status_idx + 1]
@@ -132,18 +130,38 @@ def _assign_map_status(row):
 
 
 @st.cache_data
-def load_and_clean_data(uploaded_file):
-    """Load every recognized division sheet and combine them into one clean DataFrame."""
-    xls = pd.ExcelFile(uploaded_file)
-    cleaned_sheets = {}
+def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
+    """Ingest the workbook under the chosen mode and finish deriving the
+    fields the rest of the app relies on (numeric Lat/Long, a single
+    display status, a single effective funding figure).
 
-    for sheet in xls.sheet_names:
-        if sheet in DATA_SHEETS:
-            cleaned = process_sheet(xls, sheet)
-            if not cleaned.empty:
-                cleaned_sheets[sheet] = cleaned
+    Rows without parseable coordinates are kept here (not dropped) --
+    they're the candidates for the "Resolve Missing Coordinates" geocoding
+    step in the sidebar. The app still only maps/tracks KPIs for rows that
+    end up with coordinates; that filtering happens later, after geocoding
+    has had a chance to fill gaps in. Rows without status simply display
+    as 'Unknown'.
 
-    combined = pd.concat(cleaned_sheets.values(), ignore_index=True)
+    In Legacy Tracker mode, every CEST/LGIA/SSCP sheet is combined (they
+    are genuinely different divisions). In Cost List / Any Template mode,
+    only `selected_sheet` is loaded -- a workbook in this format is often
+    several dated snapshots of the *same* projects, not separate
+    divisions, so combining all sheets would multiply-count every project.
+    """
+    if ingestion_mode == "legacy":
+        sheet_filter = DATA_SHEETS
+    elif selected_sheet is not None:
+        sheet_filter = [selected_sheet]
+    else:
+        sheet_filter = None
+
+    combined = process_workbook(uploaded_file, sheet_filter=sheet_filter)
+
+    if combined.empty:
+        return combined
+
+    combined["Lat"] = pd.to_numeric(combined["Lat"], errors="coerce")
+    combined["Long"] = pd.to_numeric(combined["Long"], errors="coerce")
     combined["Map_Status"] = combined.apply(_assign_map_status, axis=1)
     combined = combined.dropna(subset=["Lat", "Long"])
 
@@ -151,9 +169,169 @@ def load_and_clean_data(uploaded_file):
 
 
 # ==========================================
+# 2.5 GEOCODING ENGINE (MAPBOX)
+# ==========================================
+# Task 7.1: Provider Setup & Security
+# ------------------------------------
+# Requires a Mapbox access token stored in .streamlit/secrets.toml:
+#   MAPBOX_API_KEY = "pk.xxxxxxxx"
+# Never hardcode the token in source. If it's missing, geocoding is
+# disabled in the UI (see Task 7.4) rather than the app crashing.
+MAPBOX_GEOCODING_URL = "https://api.mapbox.com/geocoding/v5/mapbox.places/{query}.json"
+GEOCODE_REGION_CONTEXT = "Davao Region, Philippines"
+GEOCODE_COUNTRY_CODE = "ph"
+# (min_lon, min_lat, max_lon, max_lat) -- covers Davao del Norte, Davao del
+# Sur, Davao Oriental, Davao de Oro, and Davao Occidental with a small
+# buffer. Used both as a hard Mapbox `bbox` filter and as a client-side
+# sanity check on whatever comes back, so a fuzzy agency-name match in
+# Luzon or Visayas gets rejected instead of silently plotted.
+DAVAO_REGION_BBOX = (125.0, 5.5, 126.7, 8.1)  # min_lon, min_lat, max_lon, max_lat
+
+
+def get_mapbox_token():
+    """Read the Mapbox token from Streamlit secrets. Returns None (rather
+    than raising) if it isn't configured, so the caller can degrade
+    gracefully instead of crashing the whole app."""
+    try:
+        return st.secrets.get("MAPBOX_API_KEY")
+    except Exception:
+        return None
+
+
+# Task 7.2: Address Contextualization Logic
+# ------------------------------------------
+def build_geocode_query(row):
+    """Build a search string for the geocoder out of whatever location
+    signal a row actually has. Prefers 'Implementing Agency' (which also
+    covers 'Implementing Partner' -- both map to this canonical field) since
+    that's a searchable organization/site name, and falls back to 'Location'
+    only if no agency/partner is recorded. Appends the region context so a
+    bare name like 'DOST XI Regional Office' resolves to somewhere in Davao
+    Region instead of matching globally."""
+    agency = clean_missing(row.get("Implementing Agency", ""), fallback="")
+    location = clean_missing(row.get("Location", ""), fallback="")
+
+    base = None
+    if agency:
+        base = agency
+    elif location:
+        base = location
+
+    if not base:
+        return None
+
+    base = base.strip()
+    if "davao" not in base.lower() and "philippines" not in base.lower():
+        base = f"{base}, {GEOCODE_REGION_CONTEXT}"
+
+    return base
+
+
+# Task 7.3: Cached Fetching & Rate Limit Handling
+# -------------------------------------------------
+@st.cache_data(show_spinner=False)
+def geocode_address_mapbox(query, api_token):
+    """Resolve one query string to (lat, long) via the Mapbox Geocoding
+    API. Cached by (query, token) so a query already resolved this
+    session never re-hits the API -- important both for cost and for
+    respecting rate limits on repeated runs over the same dataset.
+
+    Results are hard-constrained to DAVAO_REGION_BBOX (both via Mapbox's
+    own `bbox` parameter and a client-side re-check) so a fuzzy match on
+    an agency/office name common across the Philippines -- e.g. multiple
+    unrelated offices sharing a generic name -- can't resolve to a
+    same-named place in Luzon or Visayas. Returns None on any failure (no
+    match, out-of-region match, network error, bad response) so the
+    caller can add it to the manual-review fallback list."""
+    if not query or not api_token:
+        return None
+
+    min_lon, min_lat, max_lon, max_lat = DAVAO_REGION_BBOX
+    url = MAPBOX_GEOCODING_URL.format(query=requests.utils.quote(query))
+    params = {
+        "access_token": api_token,
+        "limit": 1,
+        "country": GEOCODE_COUNTRY_CODE,
+        "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+        "proximity": f"{DAVAO_CENTER[1]},{DAVAO_CENTER[0]}",  # Mapbox wants lon,lat
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except (requests.RequestException, ValueError):
+        return None
+    finally:
+        # Gentle throttle -- well within Mapbox's free-tier rate limits,
+        # just avoids hammering the API on large batches.
+        time.sleep(0.1)
+
+    features = data.get("features") or []
+    if not features:
+        return None
+
+    # Mapbox returns [longitude, latitude].
+    lon, lat = features[0]["center"]
+
+    # Belt-and-suspenders: reject anything outside the region even if the
+    # bbox param somehow let it through (e.g. an older Mapbox dataset
+    # ignoring bbox for an exact-name hit).
+    if not (min_lon <= lon <= max_lon and min_lat <= lat <= max_lat):
+        return None
+
+    return (lat, lon)
+
+
+def resolve_missing_coordinates(df, api_token):
+    """Task 7.4 core loop (UI lives in the sidebar, see MAIN APPLICATION
+    LOGIC): geocode every row missing Lat/Long in place. Returns the
+    updated df plus a list of rows that couldn't be resolved, so DOST
+    staff can review them manually rather than the app silently dropping
+    them."""
+    df = df.copy()
+    missing_mask = df["Lat"].isna() | df["Long"].isna()
+    missing_idx = df[missing_mask].index.tolist()
+
+    failures = []
+    progress = st.sidebar.progress(0, text="Resolving coordinates...")
+
+    for i, idx in enumerate(missing_idx):
+        row = df.loc[idx]
+        query = build_geocode_query(row)
+        coords = geocode_address_mapbox(query, api_token) if query else None
+
+        if coords:
+            df.at[idx, "Lat"] = coords[0]
+            df.at[idx, "Long"] = coords[1]
+        else:
+            failures.append({
+                "Project Title": row.get("Project Title", "Untitled"),
+                "Division": row.get("Division", ""),
+                "Query Used": query or "(no Location or Implementing Agency to search)",
+            })
+
+        progress.progress((i + 1) / len(missing_idx), text=f"Resolving {i + 1}/{len(missing_idx)}...")
+
+    progress.empty()
+    return df, failures
+
+
+# ==========================================
 # 3. MAP GENERATION
 # ==========================================
-def _build_badge_html(abbrev, hex_color):
+def _build_standard_pin_html(hex_color, scale=1.0):
+    """Build the HTML for a standard map pin with a specific color."""
+    return f"""
+    <div style="display: flex; justify-content: center; align-items: center; width: 40px; height: 40px; transform: scale({scale}); transform-origin: bottom center;">
+        <svg viewBox="0 0 24 24" fill="{hex_color}" xmlns="http://www.w3.org/2000/svg" style="width: 30px; height: 30px; filter: drop-shadow(2px 4px 6px rgba(0,0,0,0));">
+            <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
+        </svg>
+    </div>
+    """
+
+
+def _build_badge_html(abbrev, hex_color, scale=1.0):
     """Build the HTML for a marker's abbreviation badge."""
     return f"""
     <div style="
@@ -171,6 +349,8 @@ def _build_badge_html(abbrev, hex_color):
         box-shadow: 0px 3px 6px rgba(0,0,0,0.3);
         white-space: nowrap;
         cursor: pointer;
+        transform: scale({scale});
+        transform-origin: center center;
     ">
         <div style="width: 8px; height: 8px; border-radius: 50%; background-color: {hex_color}; margin-right: 5px;"></div>
         {abbrev}
@@ -178,27 +358,129 @@ def _build_badge_html(abbrev, hex_color):
     """
 
 
-def create_map(df):
-    """Render the Davao region map with a clustered marker per project."""
-    davao_map = folium.Map(location=DAVAO_CENTER, zoom_start=DAVAO_ZOOM_START)
-    marker_cluster = MarkerCluster().add_to(davao_map)
+_ABBREV_STOPWORDS = {"of", "the", "and", "for", "in", "to", "a", "an", "on", "at", "&"}
 
-    for _, row in df.iterrows():
-        abbrev = str(row.get("Name Abbreviation", "DOST Project"))
+
+def derive_project_abbreviation(title, max_letters=6):
+    """Build a short badge label out of a project's title when no
+    'Name Abbreviation' was supplied by the source file -- initials of the
+    significant words, e.g. 'Community-Based Skills Training Program' ->
+    'CBSTP'. Falls back to the first few letters of the title itself if it
+    can't extract multiple words, and to 'N/A' if there's no title at all."""
+    if not isinstance(title, str) or not title.strip():
+        return "N/A"
+
+    words = re.findall(r"[A-Za-z0-9]+", title)
+    significant = [w for w in words if w.lower() not in _ABBREV_STOPWORDS] or words
+    if not significant:
+        return "N/A"
+
+    if len(significant) == 1:
+        return significant[0][:max_letters].upper()
+
+    return "".join(w[0].upper() for w in significant[:max_letters])
+
+
+def get_marker_label(row):
+    """Return the badge label to render on the map: the source file's own
+    'Name Abbreviation' when it actually has one, otherwise an abbreviation
+    derived from the Project Title. This is what fixes newly-geocoded
+    projects (and any Cost List / Any Template row) showing up as a blank
+    or 'nan' badge on the map."""
+    raw = row.get("Name Abbreviation")
+    if pd.notna(raw) and str(raw).strip():
+        return str(raw).strip()
+    return derive_project_abbreviation(row.get("Project Title"))
+
+
+def add_legend(folium_map):
+    legend_html = '''
+    <div style="
+        position: absolute; 
+        bottom: 30px; 
+        right: 10px; 
+        z-index: 9999; 
+        background-color: white; 
+        padding: 15px; 
+        border-radius: 8px; 
+        border: 2px solid rgba(0,0,0,0.1);
+        box-shadow: 0px 3px 6px rgba(0,0,0,0.3);
+        font-family: 'Montserrat', Arial, sans-serif;
+        font-size: 12px;
+        ">
+        <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: bold; color: #2c3e50;">Project Divisions</h4>
+    '''
+    for div, color in DIVISION_COLORS.items():
+        legend_html += f'''
+        <div style="display: flex; align-items: center; margin-bottom: 8px;">
+            <div style="width: 14px; height: 14px; background-color: {color}; border-radius: 50%; margin-right: 8px;"></div>
+            <span style="color: #2c3e50; font-weight: 600;">{div}</span>
+        </div>
+        '''
+    legend_html += f'''
+        <div style="display: flex; align-items: center;">
+            <div style="width: 14px; height: 14px; background-color: {DEFAULT_MARKER_COLOR}; border-radius: 50%; margin-right: 8px;"></div>
+            <span style="color: #2c3e50; font-weight: 600;">Other</span>
+        </div>
+    </div>
+    '''
+    folium_map.get_root().html.add_child(folium.Element(legend_html))
+
+
+def create_map(df, pin_style="Abbreviation Badge", enable_clustering=True, show_legend=True, scale_by_funding=False):
+    """Render the Davao region map with a clustered marker per project.
+    Rows without coordinates (e.g. from a source file that has no
+    location data) are simply skipped -- they still show up in the table,
+    KPIs, and exports, just not on the map."""
+    davao_map = folium.Map(location=DAVAO_CENTER, zoom_start=DAVAO_ZOOM_START)
+    if enable_clustering:
+        marker_parent = MarkerCluster().add_to(davao_map)
+    else:
+        marker_parent = davao_map
+        
+    mappable_df = df.dropna(subset=["Lat", "Long"])
+
+    max_funding = 0
+    if scale_by_funding and EFFECTIVE_FUNDING_COL in df.columns:
+        funding_numeric = pd.to_numeric(df[EFFECTIVE_FUNDING_COL], errors='coerce')
+        if not funding_numeric.empty:
+            max_funding = funding_numeric.max()
+
+    for _, row in mappable_df.iterrows():
+        abbrev = get_marker_label(row)
         division = str(row.get("Division", "N/A"))
         hex_color = DIVISION_COLORS.get(division, DEFAULT_MARKER_COLOR)
+
+        scale = 1.0
+        if scale_by_funding and max_funding > 0:
+            funding = pd.to_numeric(row.get(EFFECTIVE_FUNDING_COL), errors='coerce')
+            if pd.notna(funding) and funding > 0:
+                # Scale between 0.2x and 1.2x based on area (sqrt of funding)
+                scale = 0.2 + (1.2 - 0.2) * ((funding ** 0.5) / (max_funding ** 0.5))
+
+        if pin_style == "Standard Color Pin":
+            icon = DivIcon(
+                icon_anchor=(15, 30),
+                html=_build_standard_pin_html(hex_color, scale),
+                class_name="custom-pin",
+            )
+        else:
+            icon = DivIcon(
+                icon_anchor=(0, 0),
+                html=_build_badge_html(abbrev, hex_color, scale),
+                # Removes Leaflet's default icon size/overflow constraints
+                # so the badge can render at its natural size.
+                class_name="custom-badge",
+            )
 
         folium.Marker(
             location=[row["Lat"], row["Long"]],
             tooltip="📍 View project details",
-            icon=DivIcon(
-                icon_anchor=(0, 0),
-                html=_build_badge_html(abbrev, hex_color),
-                # Removes Leaflet's default icon size/overflow constraints
-                # so the badge can render at its natural size.
-                class_name="custom-badge",
-            ),
-        ).add_to(marker_cluster)
+            icon=icon,
+        ).add_to(marker_parent)
+
+    if show_legend:
+        add_legend(davao_map)
 
     return davao_map
 
@@ -283,7 +565,16 @@ st.markdown("""
         [data-testid="stSidebar"] .stImage {
             margin-top: -2.5rem;
         }
- 
+
+        /* Divider */
+        .st-emotion-cache-17ta2sm hr {
+            padding: 0 !important;
+            color: inherit !important;
+            border-width: medium medium 1px !important;
+            border-style: none none solid !important;
+            border-color: currentcolor currentcolor #FFFFFF !important;  
+            border-image: none !important;
+        }
  
         /* ==========================================
            4. FILE UPLOADER
@@ -478,17 +769,69 @@ st.markdown("""
         }
 
         /* ==========================================
-           12. SIDEBAR ELEMENTS COLOR FIX
+           12. SIDEBAR ELEMENTS COLOR FIX (multiselect / selectbox)
            ========================================== */
-        .st-emotion-cache-yiekhv {
+        /* The previous version of this fix targeted Streamlit's
+           auto-generated .st-emotion-cache-* / .st-XX class names, captured
+           from a browser inspector at one point in time. Those hashes come
+           from Emotion (CSS-in-JS) and are NOT stable across Streamlit
+           versions or even separate rebuilds -- which is exactly why the
+           filter widgets intermittently reverted to an unstyled white
+           background that blended into the page. BaseWeb (the underlying
+           component library Streamlit's select/multiselect widgets are
+           built on) instead exposes `data-baseweb` attributes that don't
+           change with the build hash, so we target those.
+        */
+
+        /* The select/multiselect input box itself: keep it a crisp white
+           box so it reads clearly against the dark sidebar, regardless of
+           which internal class names this Streamlit build happens to use. */
+        [data-testid="stSidebar"] [data-baseweb="select"] > div {
+            background-color: #FFFFFF !important;
+            border-color: #FFFFFF !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="select"] input {
+            color: #2C3E50 !important;
+        }
+
+        /* Selected-value "pills" inside multiselect widgets (e.g. the
+           Division / Status filters) */
+        [data-testid="stSidebar"] [data-baseweb="tag"] {
+            background-color: #00AEEF !important;
+            color: #FFFFFF !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="tag"] span {
+            color: #FFFFFF !important;
+        }
+        [data-testid="stSidebar"] [data-baseweb="tag"] svg {
+            fill: #FFFFFF !important;
+        }
+
+        /* The dropdown options list renders in a portal at the document
+           root, not nested inside the sidebar, so it needs its own
+           (unscoped) selector rather than [data-testid="stSidebar"] ... */
+        [data-baseweb="popover"] [data-baseweb="menu"] {
+            background-color: #FFFFFF !important;
+        }
+        [data-baseweb="popover"] [data-baseweb="menu"] li,
+        [data-baseweb="popover"] [data-baseweb="menu"] li * {
+            color: #2C3E50 !important;
+        }
+
+        [role=radiogroup] {
+            margin-left: 1rem !important;
+        }
+
+        [data-testid="stTooltipIcon"] svg {
+            stroke: #FFFFFF !important;
+            stroke-width: 2.25 !important;
+        }
+
+        .st-by {
             background-color: #FFFFFF !important;
         }
 
-        .st-f3 {
-            background-color: transparent !important;
-        }
-
-        .st-fg {
+        .st-g6 {
             background-color: #FFFFFF !important;
         }
 
@@ -589,15 +932,16 @@ def show_raw_data(df):
 
 
 @st.dialog("🗺️ Fullscreen Map View", width="large")
-def show_fullscreen_map(df):
+def show_fullscreen_map(df, pin_style, enable_clustering, show_legend, scale_by_funding):
     """Render the map in a large modal window for better visibility."""
-    project_map = create_map(df)
+    project_map = create_map(df, pin_style, enable_clustering, show_legend, scale_by_funding)
+    map_key = f"fullscreen_map_{show_legend}_{enable_clustering}_{pin_style}_{scale_by_funding}"
     map_data = st_folium(
         project_map,
         use_container_width=True,
         height=570,
         returned_objects=["last_object_clicked"],
-        key="fullscreen_map"
+        key=map_key
     )
     
     clicked = map_data.get("last_object_clicked")
@@ -620,7 +964,7 @@ def show_fullscreen_map(df):
 
 
 @st.dialog("🖼️ Map Export Options", width="large")
-def show_export_dialog(df):
+def show_export_dialog(df, pin_style, enable_clustering, show_legend, scale_by_funding):
     """Configure, preview, and download the high-res map export."""
     if not EXPORT_AVAILABLE:
         st.warning("⚠️ High-Res Map Export is currently disabled. Please install `selenium`, `webdriver-manager`, and `pillow` to enable this feature.")
@@ -638,22 +982,49 @@ def show_export_dialog(df):
         with st.spinner("Capturing map and generating report (this may take a few seconds)..."):
             # Create a dedicated map for export with the selected zoom and use the fixed DAVAO_CENTER
             export_map = folium.Map(location=DAVAO_CENTER, zoom_start=zoom_level, zoom_control=False)
-            marker_cluster = MarkerCluster().add_to(export_map)
+            if enable_clustering:
+                marker_parent = MarkerCluster().add_to(export_map)
+            else:
+                marker_parent = export_map
 
-            for _, row in df.iterrows():
-                abbrev = str(row.get("Name Abbreviation", "DOST Project"))
+            max_funding = 0
+            if scale_by_funding and EFFECTIVE_FUNDING_COL in df.columns:
+                funding_numeric = pd.to_numeric(df[EFFECTIVE_FUNDING_COL], errors='coerce')
+                if not funding_numeric.empty:
+                    max_funding = funding_numeric.max()
+
+            for _, row in df.dropna(subset=["Lat", "Long"]).iterrows():
+                abbrev = get_marker_label(row)
                 division = str(row.get("Division", "N/A"))
                 hex_color = DIVISION_COLORS.get(division, DEFAULT_MARKER_COLOR)
 
+                scale = 1.0
+                if scale_by_funding and max_funding > 0:
+                    funding = pd.to_numeric(row.get(EFFECTIVE_FUNDING_COL), errors='coerce')
+                    if pd.notna(funding) and funding > 0:
+                        scale = 0.7 + (2.5 - 0.7) * ((funding ** 0.5) / (max_funding ** 0.5))
+
+                if pin_style == "Standard Color Pin":
+                    icon = DivIcon(
+                        icon_anchor=(15, 30),
+                        html=_build_standard_pin_html(hex_color, scale),
+                        class_name="custom-pin",
+                    )
+                else:
+                    icon = DivIcon(
+                        icon_anchor=(0, 0),
+                        html=_build_badge_html(abbrev, hex_color, scale),
+                        class_name="custom-badge",
+                    )
+
                 folium.Marker(
                     location=[row["Lat"], row["Long"]],
-                    icon=DivIcon(
-                        icon_anchor=(0, 0),
-                        html=_build_badge_html(abbrev, hex_color),
-                        class_name="custom-badge",
-                    ),
-                ).add_to(marker_cluster)
+                    icon=icon,
+                ).add_to(marker_parent)
             
+            if show_legend:
+                add_legend(export_map)
+
             # Hide scrollbar in the export map
             export_map.get_root().header.add_child(folium.Element("<style>body, html { margin:0; padding:0; overflow: hidden !important; }</style>"))
             
@@ -683,10 +1054,45 @@ def show_export_dialog(df):
 # ==========================================
 st.sidebar.image("assets/dost_davao_logo.png", width="stretch")
 
+data_format_label = st.sidebar.radio(
+    "Data Format:",
+    options=list(INGESTION_MODES.keys()),
+    index=0,
+    help=(
+        "Select the option that matches your Excel file.\n\n"
+        "• Division-Based Template – For files organized into separate "
+        "CEST, LGIA, and SSCP worksheets.\n\n"
+        "• General Template – For project lists, project cost reports, "
+        "and other supported DOST Excel templates. The application will "
+        "automatically recognize the file format.\n\n"
+        "Note: Only projects with valid coordinates can be displayed on the map."
+    ),
+)
+ingestion_mode = INGESTION_MODES[data_format_label]
+
 uploaded_file = st.sidebar.file_uploader(
     "Upload DOST-Davao Excel File (.xlsx)",
     type=["xlsx"],
 )
+
+selected_sheet = None
+if uploaded_file is not None and ingestion_mode == "auto":
+    candidate_sheets = list_candidate_sheets(uploaded_file)
+    if not candidate_sheets:
+        st.sidebar.error("⚠️ No sheet with a recognizable project list was found in this file.")
+    elif len(candidate_sheets) == 1:
+        selected_sheet = candidate_sheets[0]
+    else:
+        selected_sheet = st.sidebar.selectbox(
+            "Select Worksheet:",
+            options=candidate_sheets,
+            index=len(candidate_sheets) - 1,
+            help=(
+                "This workbook contains multiple worksheets.\n\n"
+                "Select the worksheet you want to display. "
+                "Only the selected worksheet will be loaded and shown on the map."
+            ),
+        )
 
 
 # ==========================================
@@ -735,7 +1141,7 @@ def format_export_data(df):
     return export_df[final_cols]
 
 
-def render_filters(clean_df):
+def render_filters(clean_df, pin_style, enable_clustering, show_legend, scale_by_funding):
     """Render the sidebar filter controls and return the filtered DataFrame."""
     st.sidebar.header("🔍 Filter Dashboard")
 
@@ -778,7 +1184,7 @@ def render_filters(clean_df):
             if len(date_range) == 2:
                 start_dt = pd.to_datetime(date_range[0])
                 end_dt = pd.to_datetime(date_range[1])
-                filtered_approval_dates = pd.to_datetime(filtered_df[DATE_APPROVED_COL], errors="coerce")
+                filtered_approval_dates = pd.to_datetime(filtered_df[DATE_APPROVED_COL], errors="coerce", format="mixed")
                 
                 date_mask = (filtered_approval_dates >= start_dt) & (filtered_approval_dates <= end_dt)
                 if include_missing_dates:
@@ -787,7 +1193,7 @@ def render_filters(clean_df):
                 filtered_df = filtered_df[date_mask]
             elif len(date_range) == 1:
                 start_dt = pd.to_datetime(date_range[0])
-                filtered_approval_dates = pd.to_datetime(filtered_df[DATE_APPROVED_COL], errors="coerce")
+                filtered_approval_dates = pd.to_datetime(filtered_df[DATE_APPROVED_COL], errors="coerce", format="mixed")
                 
                 date_mask = (filtered_approval_dates >= start_dt)
                 if include_missing_dates:
@@ -850,7 +1256,7 @@ def render_filters(clean_df):
 
     if st.sidebar.button("🖼️ Map Export Options", width="stretch"):
         st.session_state.pop("export_preview_bytes", None) # clear old preview
-        show_export_dialog(filtered_df)
+        show_export_dialog(filtered_df, pin_style, enable_clustering, show_legend, scale_by_funding)
 
     return filtered_df
 
@@ -1142,17 +1548,112 @@ def create_branded_export(map_image, selected_divisions, selected_statuses, titl
 # ==========================================
 if uploaded_file is not None:
     with st.spinner("Processing..."):
-        clean_df = load_and_clean_data(uploaded_file)
+        clean_df = load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet)
 
-    filtered_df = render_filters(clean_df)
+    if clean_df.empty:
+        st.error(
+            f"⚠️ No projects with valid coordinates were found in this file under the "
+            f"**{data_format_label}** setting. The map only displays projects with "
+            f"latitude and longitude information (or a Coordinates column). If this "
+            f"file does not contain location data, try selecting a different worksheet "
+            f"or a different Data Format in the sidebar."
+        )
+        st.stop()
+
+    # Persist a working copy across reruns (keyed to this exact file/mode/
+    # sheet combination) so geocoded coordinates survive button clicks and
+    # other widget interactions instead of resetting every rerun.
+    dataset_key = (
+        getattr(uploaded_file, "name", None),
+        getattr(uploaded_file, "size", None),
+        ingestion_mode,
+        selected_sheet,
+    )
+    if st.session_state.get("_dataset_key") != dataset_key:
+        st.session_state["_dataset_key"] = dataset_key
+        st.session_state["working_df"] = clean_df.copy()
+        st.session_state["geocode_failures"] = []
+
+    working_df = st.session_state["working_df"]
+    missing_coords_count = int((working_df["Lat"].isna() | working_df["Long"].isna()).sum())
+    st.sidebar.header("📍 Missing Coordinates")
+    if missing_coords_count == 0:
+        st.sidebar.caption("Every project has coordinates.")
+    else:
+        st.sidebar.caption(
+            f"{missing_coords_count} project(s) have no Lat/Long yet and won't "
+            "appear on the map or in KPIs until resolved."
+        )
+        mapbox_token = get_mapbox_token()
+        if not mapbox_token:
+            st.sidebar.warning(
+                "Mapbox isn't configured yet. Add `MAPBOX_API_KEY` to "
+                "`.streamlit/secrets.toml` to enable this."
+            )
+        elif st.sidebar.button(f"📍 Resolve Missing Coordinates ({missing_coords_count})"):
+            updated_df, failures = resolve_missing_coordinates(working_df, mapbox_token)
+            st.session_state["working_df"] = updated_df
+            st.session_state["geocode_failures"] = failures
+            working_df = updated_df
+
+            resolved_count = missing_coords_count - len(failures)
+            if failures:
+                st.sidebar.warning(f"✅ Resolved {resolved_count}. ⚠️ {len(failures)} need manual review.")
+            else:
+                st.sidebar.success(f"✅ All {resolved_count} coordinate(s) resolved!")
+
+    if st.session_state.get("geocode_failures"):
+        with st.sidebar.expander(f"⚠️ Needs Manual Review ({len(st.session_state['geocode_failures'])})"):
+            st.dataframe(
+                pd.DataFrame(st.session_state["geocode_failures"]),
+                width="stretch",
+                hide_index=True,
+            )
+            st.caption(
+                "These couldn't be automatically geocoded. Add coordinates "
+                "manually in the source file, or refine the Location / "
+                "Implementing Agency text and re-run."
+            )
+
+    mappable_df = working_df.dropna(subset=["Lat", "Long"])
+
+
+    if mappable_df.empty:
+        st.error(
+            "⚠️ No projects with usable coordinates yet. Use "
+            "**📍 Resolve Missing Coordinates** in the sidebar, or check that "
+            "this file/sheet actually has location data."
+        )
+        st.stop()
+
+
+    # Create a map options section in the sidebar
+    st.sidebar.divider()
+    st.sidebar.header("🗺️ Map Options")
+    pin_style = st.sidebar.radio(
+        "Map Pin Style:",
+        options=["Abbreviation Badge", "Standard Color Pin"],
+        index=0
+    )
+
+    # Enable or disable clustering
+    enable_clustering = st.sidebar.checkbox("Enable Marker Clustering", value=True)
+    show_legend = st.sidebar.checkbox("Show Map Legend", value=True)
+    scale_by_funding = st.sidebar.checkbox("Scale Markers by Funding", value=False)
+    
+    st.sidebar.divider()
+
+    filtered_df = render_filters(mappable_df, pin_style, enable_clustering, show_legend, scale_by_funding)
     render_kpi_scorecards(filtered_df)
 
-    project_map = create_map(filtered_df)
+    project_map = create_map(filtered_df, pin_style, enable_clustering, show_legend, scale_by_funding)
+    map_key = f"main_map_{show_legend}_{enable_clustering}_{pin_style}_{scale_by_funding}"
     map_data = st_folium(
         project_map,
         use_container_width=True,
         height=460,
         returned_objects=["last_object_clicked"],
+        key=map_key,
     )
 
     handle_map_click(map_data, filtered_df)
@@ -1160,8 +1661,7 @@ if uploaded_file is not None:
     col1, col2 = st.columns([0.85, 0.15])
     with col2:
         if st.button("🔍 Maximize Map", use_container_width=True):
-            show_fullscreen_map(filtered_df)
-
+            show_fullscreen_map(filtered_df, pin_style, enable_clustering, show_legend, scale_by_funding)
 
     # (Removed original high-res export block from main body)
 
