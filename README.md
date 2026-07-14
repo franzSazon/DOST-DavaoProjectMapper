@@ -1,5 +1,6 @@
 # DOST-Davao Project Mapper
-![Alt Text](asset/app_screenshot.png)
+
+![Alt Text](asset/project_demo.gif)
 
 ## Overview
 The DOST-Davao Project Mapper is a Streamlit application designed to ingest, process, and visualize project data from DOST-Davao Excel workbooks. It consolidates data across different divisions and provides an interactive map interface to track and manage regional projects.
