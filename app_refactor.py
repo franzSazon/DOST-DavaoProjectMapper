@@ -701,7 +701,18 @@ def resolve_missing_coordinates(df, api_token):
 # ==========================================
 # 3. MAP GENERATION
 # ==========================================
-def _build_badge_html(abbrev, hex_color):
+def _build_standard_pin_html(hex_color, scale=1.0):
+    """Build the HTML for a standard map pin with a specific color."""
+    return f"""
+    <div style="display: flex; justify-content: center; align-items: center; width: 40px; height: 40px; transform: scale({scale}); transform-origin: bottom center;">
+        <svg viewBox="0 0 24 24" fill="{hex_color}" xmlns="http://www.w3.org/2000/svg" style="width: 30px; height: 30px; filter: drop-shadow(2px 4px 6px rgba(0,0,0,0));">
+            <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z"/>
+        </svg>
+    </div>
+    """
+
+
+def _build_badge_html(abbrev, hex_color, scale=1.0):
     """Build the HTML for a marker's abbreviation badge."""
     return f"""
     <div style="
@@ -719,6 +730,8 @@ def _build_badge_html(abbrev, hex_color):
         box-shadow: 0px 3px 6px rgba(0,0,0,0.3);
         white-space: nowrap;
         cursor: pointer;
+        transform: scale({scale});
+        transform-origin: center center;
     ">
         <div style="width: 8px; height: 8px; border-radius: 50%; background-color: {hex_color}; margin-right: 5px;"></div>
         {abbrev}
@@ -761,31 +774,94 @@ def get_marker_label(row):
     return derive_project_abbreviation(row.get("Project Title"))
 
 
-def create_map(df):
+def add_legend(folium_map):
+    legend_html = '''
+    <div style="
+        position: absolute; 
+        bottom: 30px; 
+        right: 10px; 
+        z-index: 9999; 
+        background-color: white; 
+        padding: 15px; 
+        border-radius: 8px; 
+        border: 2px solid rgba(0,0,0,0.1);
+        box-shadow: 0px 3px 6px rgba(0,0,0,0.3);
+        font-family: 'Montserrat', Arial, sans-serif;
+        font-size: 12px;
+        ">
+        <h4 style="margin: 0 0 10px 0; font-size: 14px; font-weight: bold; color: #2c3e50;">Project Divisions</h4>
+    '''
+    for div, color in DIVISION_COLORS.items():
+        legend_html += f'''
+        <div style="display: flex; align-items: center; margin-bottom: 8px;">
+            <div style="width: 14px; height: 14px; background-color: {color}; border-radius: 50%; margin-right: 8px;"></div>
+            <span style="color: #2c3e50; font-weight: 600;">{div}</span>
+        </div>
+        '''
+    legend_html += f'''
+        <div style="display: flex; align-items: center;">
+            <div style="width: 14px; height: 14px; background-color: {DEFAULT_MARKER_COLOR}; border-radius: 50%; margin-right: 8px;"></div>
+            <span style="color: #2c3e50; font-weight: 600;">Other</span>
+        </div>
+    </div>
+    '''
+    folium_map.get_root().html.add_child(folium.Element(legend_html))
+
+
+def create_map(df, pin_style="Abbreviation Badge", enable_clustering=True, show_legend=True, scale_by_funding=False):
     """Render the Davao region map with a clustered marker per project.
     Rows without coordinates (e.g. from a source file that has no
     location data) are simply skipped -- they still show up in the table,
     KPIs, and exports, just not on the map."""
     davao_map = folium.Map(location=DAVAO_CENTER, zoom_start=DAVAO_ZOOM_START)
-    marker_cluster = MarkerCluster().add_to(davao_map)
+    if enable_clustering:
+        marker_parent = MarkerCluster().add_to(davao_map)
+    else:
+        marker_parent = davao_map
+        
     mappable_df = df.dropna(subset=["Lat", "Long"])
+
+    max_funding = 0
+    if scale_by_funding and EFFECTIVE_FUNDING_COL in df.columns:
+        funding_numeric = pd.to_numeric(df[EFFECTIVE_FUNDING_COL], errors='coerce')
+        if not funding_numeric.empty:
+            max_funding = funding_numeric.max()
 
     for _, row in mappable_df.iterrows():
         abbrev = get_marker_label(row)
         division = str(row.get("Division", "N/A"))
         hex_color = DIVISION_COLORS.get(division, DEFAULT_MARKER_COLOR)
 
-        folium.Marker(
-            location=[row["Lat"], row["Long"]],
-            tooltip="📍 View project details",
-            icon=DivIcon(
+        scale = 1.0
+        if scale_by_funding and max_funding > 0:
+            funding = pd.to_numeric(row.get(EFFECTIVE_FUNDING_COL), errors='coerce')
+            if pd.notna(funding) and funding > 0:
+                # Scale between 0.2x and 1.2x based on area (sqrt of funding)
+                scale = 0.2 + (1.2 - 0.2) * ((funding ** 0.5) / (max_funding ** 0.5))
+
+        if pin_style == "Standard Color Pin":
+            icon = DivIcon(
+                icon_anchor=(15, 30),
+                html=_build_standard_pin_html(hex_color, scale),
+                class_name="custom-pin",
+            )
+        else:
+            icon = DivIcon(
                 icon_anchor=(0, 0),
-                html=_build_badge_html(abbrev, hex_color),
+                html=_build_badge_html(abbrev, hex_color, scale),
                 # Removes Leaflet's default icon size/overflow constraints
                 # so the badge can render at its natural size.
                 class_name="custom-badge",
-            ),
-        ).add_to(marker_cluster)
+            )
+
+        folium.Marker(
+            location=[row["Lat"], row["Long"]],
+            tooltip="📍 View project details",
+            icon=icon,
+        ).add_to(marker_parent)
+
+    if show_legend:
+        add_legend(davao_map)
 
     return davao_map
 
@@ -870,7 +946,16 @@ st.markdown("""
         [data-testid="stSidebar"] .stImage {
             margin-top: -2.5rem;
         }
- 
+
+        /* Divider */
+        .st-emotion-cache-17ta2sm hr {
+            padding: 0 !important;
+            color: inherit !important;
+            border-width: medium medium 1px !important;
+            border-style: none none solid !important;
+            border-color: currentcolor currentcolor #FFFFFF !important;  
+            border-image: none !important;
+        }
  
         /* ==========================================
            4. FILE UPLOADER
@@ -1220,15 +1305,16 @@ def show_raw_data(df):
 
 
 @st.dialog("🗺️ Fullscreen Map View", width="large")
-def show_fullscreen_map(df):
+def show_fullscreen_map(df, pin_style, enable_clustering, show_legend, scale_by_funding):
     """Render the map in a large modal window for better visibility."""
-    project_map = create_map(df)
+    project_map = create_map(df, pin_style, enable_clustering, show_legend, scale_by_funding)
+    map_key = f"fullscreen_map_{show_legend}_{enable_clustering}_{pin_style}_{scale_by_funding}"
     map_data = st_folium(
         project_map,
         use_container_width=True,
         height=570,
         returned_objects=["last_object_clicked"],
-        key="fullscreen_map"
+        key=map_key
     )
     
     clicked = map_data.get("last_object_clicked")
@@ -1251,7 +1337,7 @@ def show_fullscreen_map(df):
 
 
 @st.dialog("🖼️ Map Export Options", width="large")
-def show_export_dialog(df):
+def show_export_dialog(df, pin_style, enable_clustering, show_legend, scale_by_funding):
     """Configure, preview, and download the high-res map export."""
     if not EXPORT_AVAILABLE:
         st.warning("⚠️ High-Res Map Export is currently disabled. Please install `selenium`, `webdriver-manager`, and `pillow` to enable this feature.")
@@ -1269,22 +1355,49 @@ def show_export_dialog(df):
         with st.spinner("Capturing map and generating report (this may take a few seconds)..."):
             # Create a dedicated map for export with the selected zoom and use the fixed DAVAO_CENTER
             export_map = folium.Map(location=DAVAO_CENTER, zoom_start=zoom_level, zoom_control=False)
-            marker_cluster = MarkerCluster().add_to(export_map)
+            if enable_clustering:
+                marker_parent = MarkerCluster().add_to(export_map)
+            else:
+                marker_parent = export_map
+
+            max_funding = 0
+            if scale_by_funding and EFFECTIVE_FUNDING_COL in df.columns:
+                funding_numeric = pd.to_numeric(df[EFFECTIVE_FUNDING_COL], errors='coerce')
+                if not funding_numeric.empty:
+                    max_funding = funding_numeric.max()
 
             for _, row in df.dropna(subset=["Lat", "Long"]).iterrows():
                 abbrev = get_marker_label(row)
                 division = str(row.get("Division", "N/A"))
                 hex_color = DIVISION_COLORS.get(division, DEFAULT_MARKER_COLOR)
 
+                scale = 1.0
+                if scale_by_funding and max_funding > 0:
+                    funding = pd.to_numeric(row.get(EFFECTIVE_FUNDING_COL), errors='coerce')
+                    if pd.notna(funding) and funding > 0:
+                        scale = 0.7 + (2.5 - 0.7) * ((funding ** 0.5) / (max_funding ** 0.5))
+
+                if pin_style == "Standard Color Pin":
+                    icon = DivIcon(
+                        icon_anchor=(15, 30),
+                        html=_build_standard_pin_html(hex_color, scale),
+                        class_name="custom-pin",
+                    )
+                else:
+                    icon = DivIcon(
+                        icon_anchor=(0, 0),
+                        html=_build_badge_html(abbrev, hex_color, scale),
+                        class_name="custom-badge",
+                    )
+
                 folium.Marker(
                     location=[row["Lat"], row["Long"]],
-                    icon=DivIcon(
-                        icon_anchor=(0, 0),
-                        html=_build_badge_html(abbrev, hex_color),
-                        class_name="custom-badge",
-                    ),
-                ).add_to(marker_cluster)
+                    icon=icon,
+                ).add_to(marker_parent)
             
+            if show_legend:
+                add_legend(export_map)
+
             # Hide scrollbar in the export map
             export_map.get_root().header.add_child(folium.Element("<style>body, html { margin:0; padding:0; overflow: hidden !important; }</style>"))
             
@@ -1403,7 +1516,7 @@ def format_export_data(df):
     return export_df[final_cols]
 
 
-def render_filters(clean_df):
+def render_filters(clean_df, pin_style, enable_clustering, show_legend, scale_by_funding):
     """Render the sidebar filter controls and return the filtered DataFrame."""
     st.sidebar.header("🔍 Filter Dashboard")
 
@@ -1512,7 +1625,7 @@ def render_filters(clean_df):
 
     if st.sidebar.button("🖼️ Map Export Options", width="stretch"):
         st.session_state.pop("export_preview_bytes", None) # clear old preview
-        show_export_dialog(filtered_df)
+        show_export_dialog(filtered_df, pin_style, enable_clustering, show_legend, scale_by_funding)
 
     return filtered_df
 
@@ -1831,9 +1944,7 @@ if uploaded_file is not None:
 
     working_df = st.session_state["working_df"]
     missing_coords_count = int((working_df["Lat"].isna() | working_df["Long"].isna()).sum())
-
-    st.sidebar.divider()
-    st.sidebar.subheader("📍 Missing Coordinates")
+    st.sidebar.header("📍 Missing Coordinates")
     if missing_coords_count == 0:
         st.sidebar.caption("Every project has coordinates.")
     else:
@@ -1874,6 +1985,7 @@ if uploaded_file is not None:
 
     mappable_df = working_df.dropna(subset=["Lat", "Long"])
 
+
     if mappable_df.empty:
         st.error(
             "⚠️ No projects with usable coordinates yet. Use "
@@ -1882,15 +1994,34 @@ if uploaded_file is not None:
         )
         st.stop()
 
-    filtered_df = render_filters(mappable_df)
+
+    # Create a map options section in the sidebar
+    st.sidebar.divider()
+    st.sidebar.header("🗺️ Map Options")
+    pin_style = st.sidebar.radio(
+        "Map Pin Style:",
+        options=["Abbreviation Badge", "Standard Color Pin"],
+        index=0
+    )
+
+    # Enable or disable clustering
+    enable_clustering = st.sidebar.checkbox("Enable Marker Clustering", value=True)
+    show_legend = st.sidebar.checkbox("Show Map Legend", value=True)
+    scale_by_funding = st.sidebar.checkbox("Scale Markers by Funding", value=False)
+    
+    st.sidebar.divider()
+
+    filtered_df = render_filters(mappable_df, pin_style, enable_clustering, show_legend, scale_by_funding)
     render_kpi_scorecards(filtered_df)
 
-    project_map = create_map(filtered_df)
+    project_map = create_map(filtered_df, pin_style, enable_clustering, show_legend, scale_by_funding)
+    map_key = f"main_map_{show_legend}_{enable_clustering}_{pin_style}_{scale_by_funding}"
     map_data = st_folium(
         project_map,
         use_container_width=True,
         height=460,
         returned_objects=["last_object_clicked"],
+        key=map_key,
     )
 
     handle_map_click(map_data, filtered_df)
@@ -1898,8 +2029,7 @@ if uploaded_file is not None:
     col1, col2 = st.columns([0.85, 0.15])
     with col2:
         if st.button("🔍 Maximize Map", use_container_width=True):
-            show_fullscreen_map(filtered_df)
-
+            show_fullscreen_map(filtered_df, pin_style, enable_clustering, show_legend, scale_by_funding)
 
     # (Removed original high-res export block from main body)
 
