@@ -1,33 +1,80 @@
 # DOST-Davao Project Mapper
 
-![Alt Text](assets/project_demo.gif)
+![Demo](assets/project_demo.gif)
 
-## Overview
-The DOST-Davao Project Mapper is a Streamlit application designed to ingest, process, and visualize project data from DOST-Davao Excel workbooks. It consolidates data across different divisions and provides an interactive map interface to track and manage regional projects.
+A Streamlit application for the Department of Science and Technology - Davao Region. It reads project tracker Excel workbooks for the CEST, LGIA, and SSCP programs, consolidates the data, and displays projects on an interactive map with filters, KPIs, and export options.
 
 ## Features
-*   **Data Ingestion and Processing:** Automatically reads and cleans data from project Excel workbooks, consolidating records across different DOST divisions (e.g., CEST, LGIA, SSCP).
-*   **Interactive Mapping:** Displays project locations on an interactive map using Folium, allowing users to visually navigate project distributions.
-*   **Filterable KPIs:** Provides key performance indicators and filtering options to analyze projects by status, division, and other relevant metrics.
-*   **Detailed Project Views:** Allows users to select individual projects on the map to view specific details and status updates.
-*   **AI Integration:** Utilizes Ollama's llama3.2:3b for advanced data processing or summarization tasks within the application.
 
-## Installation and Setup
+### Data Ingestion
+- Two ingestion modes: **Division-Based Template** (separate CEST/LGIA/SSCP sheets) and **General Template** (auto-detects header rows and project sections in other layouts).
+- Maps inconsistent source column headers (for example "Amount of Funding", "Project Cost", "Revised") to a single canonical schema.
+- Normalizes division names, project status, and funding amounts (original and revised) across sheets.
 
-1.  Clone the repository.
-2.  Install the required dependencies using pip:
-    ```bash
-    pip install -r requirements.txt
-    ```
-3.  Set up your Streamlit configuration and secrets (like API keys) in the `.streamlit/secrets.toml` file.
-4.  Run the application using Streamlit:
-    ```bash
-    streamlit run app_refactor.py
-    ```
+### Mapping
+- Displays projects on a Folium map centered on Davao, with marker clustering, division-based color coding, and configurable pin styles.
+- Resolves missing coordinates using the Mapbox Geocoding API based on project location and beneficiary data.
+- Clicking a marker opens a panel with project details: funding, timeline, proponent, and status.
+
+### Filters and KPIs
+- Sidebar filters for division, project status, approval date range, and budget range, with options to include or exclude records with missing values.
+- KPI scorecards summarizing the currently filtered project set (counts, funding totals, status breakdown).
+- Raw data table view of the cleaned dataset.
+- CSV export of the filtered results.
+
+### Map Export
+- Generates a branded map image with legend and summary stats, using a headless browser screenshot pipeline.
+- Optional feature. Requires additional dependencies listed in Installation.
+
+### AI Summary and Q&A
+- Generates a text summary of the filtered project data and supports free-form questions about the dataset.
+- Uses a local Ollama LLM (`llama3.2:3b`). Data is processed on the local machine, not sent to an external API.
+- Optional feature. Requires Ollama running locally.
+
+## Installation
+
+1. Clone the repository.
+2. Install the core dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. To enable map export, install the additional dependencies:
+   ```bash
+   pip install selenium webdriver-manager pillow
+   ```
+   Without these, the app runs normally and the export feature is disabled.
+4. To enable geocoding, add a Mapbox token to `.streamlit/secrets.toml`:
+   ```toml
+   MAPBOX_API_KEY = "pk.xxxxxxxx"
+   ```
+5. To enable the AI summary and Q&A features, install [Ollama](https://ollama.com), pull the `llama3.2:3b` model, and set the URL in `.streamlit/secrets.toml` if it is not the default:
+   ```toml
+   OLLAMA_URL = "http://localhost:11434"
+   ```
+6. Run the app:
+   ```bash
+   streamlit run app_refactor.py
+   ```
+
+## Usage
+
+1. Select the ingestion mode that matches your workbook (Division-Based Template or General Template).
+2. Upload the project Excel file in the sidebar.
+3. Use the filters to narrow projects by division, status, date, or budget.
+4. Click markers on the map for project details, check the KPI scorecards, and export data as CSV or a map image.
+5. Optionally, generate an AI summary or ask questions about the filtered dataset.
 
 ## Technology Stack
-*   Python
-*   Streamlit
-*   Pandas
-*   Folium
-*   Ollama local LLM (llama3.2:3b)
+
+| Layer | Tools |
+|---|---|
+| App framework | Streamlit |
+| Data processing | Pandas, openpyxl |
+| Mapping | Folium, streamlit-folium |
+| Geocoding | Mapbox Geocoding API |
+| AI summary/Q&A | Ollama (local LLM, `llama3.2:3b`) |
+| Map export (optional) | Selenium, webdriver-manager, Pillow |
+
+## Status
+
+Maintained for internal use at DOST-Davao. Issues and pull requests are welcome.
