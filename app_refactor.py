@@ -1199,6 +1199,23 @@ st.markdown("""
             color: #2C3E50 !important;
         }
 
+        [role=radiogroup] {
+            margin-left: 1rem !important;
+        }
+
+        [data-testid="stTooltipIcon"] svg {
+            stroke: #FFFFFF !important;
+            stroke-width: 2.25 !important;
+        }
+
+        .st-by {
+            background-color: #FFFFFF !important;
+        }
+
+        .st-g6 {
+            background-color: #FFFFFF !important;
+        }
+
         /* ==========================================
            13. SLIDER TWEAKS
            ========================================== */
