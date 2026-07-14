@@ -14,12 +14,9 @@ from folium.features import DivIcon
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 import io
-import os
-import re
 import requests
 import time
 import tempfile
-import openpyxl
 try:
     from PIL import Image, ImageDraw, ImageFont
     from selenium import webdriver
@@ -33,71 +30,18 @@ except ImportError:
 # ==========================================
 # 1. CONSTANTS
 # ==========================================
-# --- Canonical internal schema -------------------------------------------
-# Every ingestion path (legacy tracker sheets OR the new print-style cost
-# list) is normalized down to these exact column names before anything
-# else in the app touches the data. Nothing downstream should ever
-# reference a raw source-workbook header again.
+# Exact column headers as they appear in the source Excel workbook.
+STATUS_BOOL_COL = "Project status"
 GROUP_KEY_COL = "Project Title"
-AMOUNT_ORIGINAL_COL = "Amount (Original)"
-AMOUNT_REVISED_COL = "Amount (Revised)"
-EFFECTIVE_FUNDING_COL = "Amount (Effective)"
-DATE_APPROVED_COL = "Date of Approval"
-DATE_END_COL = "Date of Completion/Terminated"
+COORDINATES_COL = "Coordinates"
+FUNDING_COL = "Amount of \nfunding provided"
+DATE_APPROVED_COL = "Date of\nApproval"
+DATE_END_COL = "Date of \nCompletion/\nTerminated\n(if terminated)"
 
-OUTPUT_SCHEMA = [
-    "Division", "No.", "Project Title", "Name Abbreviation", "Location", "Beneficiaries",
-    "Implementing Agency", "Name of Proponent", "DOST Coordinator",
-    AMOUNT_ORIGINAL_COL, AMOUNT_REVISED_COL,
-    DATE_APPROVED_COL, DATE_END_COL,
-    "Ongoing", "Completed", "Terminated",
-    "Remarks", "Lat", "Long", "Source Sheet",
-]
-
-# (canonical_field, [keyword fragments to match against a lowercased,
-# whitespace-collapsed header]). A header is assigned to the FIRST field
-# in this list whose keywords it matches and that hasn't already been
-# claimed by an earlier column in the same sheet.
-FIELD_ALIASES = [
-    ("Project ID",                    ["project id"]),
-    ("Project Title",                 ["project title", "title of the project", "project name"]),
-    ("Name Abbreviation",             ["abbreviation", "abbrev", "acronym"]),
-    ("Division",                      ["division", "program"]),
-    ("DOST Coordinator",              ["dost xi project coordinator", "dost coordinator", "project coordinator"]),
-    ("Name of Proponent",             ["name of proponent", "proponent", "project leader", "name of project leader"]),
-    ("Implementing Agency",           ["implementing agency", "implementing partner", "agency", "partner"]),
-    ("Location",                      ["location", "site"]),
-    ("Beneficiaries",                 ["beneficiaries", "beneficiary"]),
-    ("Date of Approval",              ["date of approval", "approval date"]),
-    ("Date of Completion/Terminated", ["date of completion", "completion/terminated", "terminated"]),
-    ("Project status",                ["project status"]),
-    ("Remarks",                       ["remarks", "notes"]),
-    ("Coordinates",                   ["coordinates", "coordinate", "gps"]),
-    ("Lat",                           ["latitude", "lat"]),
-    ("Long",                          ["longitude", "long", "lng"]),
-    (AMOUNT_REVISED_COL,              ["revised", "adjusted"]),
-    (AMOUNT_ORIGINAL_COL,             ["original", "amount of funding", "funding provided", "project cost", "amount"]),
-    ("No.",                           ["no.", "no "]),
-]
-
-# Non-project rows to skip when a division is delimited by section headers
-# (e.g. "LGIA sub-total", signature blocks) rather than by separate sheets.
-STOP_MARKERS = ("sub-total", "subtotal", "grand total", "prepared by", "reviewed by", "approved by")
-
-# Raw section/sheet division text -> canonical division code used
-# everywhere downstream (colors, filters, KPIs).
-DIVISION_NORMALIZATION = {
-    "LOCAL GIA PROGRAM": "LGIA", "LGIA": "LGIA",
-    "CEST PROGRAM": "CEST", "CEST": "CEST",
-    "SMART AND SUSTAINABLE PROGRAM": "SSCP", "SSCP": "SSCP",
-}
-
-# Sheets scanned in "Legacy Tracker" ingestion mode (others are ignored).
-# "Cost List / Any Template" mode instead scans every sheet and keeps
-# whichever ones have a recognizable header row.
+# Sheets in the workbook that contain project data (others are ignored).
 DATA_SHEETS = ["CEST", "LGIA", "SSCP"]
 
-# Accepted TRUE/FALSE representations found in a raw "Project status" cell.
+# Accepted TRUE/FALSE representations found in the raw sheet.
 BOOL_MAP = {
     "TRUE": True, "FALSE": False,
     "True": True, "False": False,
@@ -136,378 +80,53 @@ INGESTION_MODES = {
     "General Template": "auto",
 }
 
+    status_idx = original_cols.index(STATUS_BOOL_COL)
+    status_label_col = original_cols[status_idx + 1]
 
-def clean_header_text(v):
-    return re.sub(r"\s+", " ", str(v)).strip().lower() if v is not None else ""
-
-
-def map_headers(header_cells):
-    """Returns dict: canonical_field -> original column header text.
-    Each column is assigned to the FIRST alias group it matches that hasn't
-    already been claimed by an earlier column (so e.g. two 'cost' columns
-    become Original then Revised, in the order they appear)."""
-    mapping = {}
-    claimed_fields = set()
-    for raw in header_cells:
-        text = clean_header_text(raw)
-        if not text:
-            continue
-        for field, keywords in FIELD_ALIASES:
-            if field in claimed_fields:
-                continue
-            if any(kw in text for kw in keywords):
-                mapping[field] = raw
-                claimed_fields.add(field)
-                break
-    return mapping
-
-
-def find_header_row(ws, max_scan=25):
-    """Picks the row (within the first max_scan rows) with the most recognizable
-    field matches -- this is template-agnostic, no fixed header text required."""
-    best_row, best_score = None, 0
-    for row in ws.iter_rows(min_row=1, max_row=max_scan):
-        values = [c.value for c in row]
-        mapping = map_headers(values)
-        if "Project Title" in mapping and len(mapping) > best_score:
-            best_row, best_score = row[0].row, len(mapping)
-    return best_row
-
-
-def detect_structure(df, mapping):
-    if "Project status" in mapping:
-        return "merged_status"
-
-    title_col = mapping.get("Project Title")
-    first_col = df.columns[0]
-    if title_col is None:
-        return "flat"
-
-    has_title = df[title_col].notna() & (df[title_col].astype(str).str.strip() != "")
-    first_filled = df[first_col].notna() & (df[first_col].astype(str).str.strip() != "")
-    section_like_rows = (~has_title) & first_filled
-
-    if section_like_rows.sum() >= 1:
-        return "section_headers"
-    return "flat"
-
-
-def populate_coordinates_from_temp(unified_df):
-    if "Lat" not in unified_df.columns:
-        unified_df["Lat"] = pd.NA
-    if "Long" not in unified_df.columns:
-        unified_df["Long"] = pd.NA
-
-    if "_TEMP_COORDINATES_RAW" in unified_df.columns:
-        coords_raw = unified_df["_TEMP_COORDINATES_RAW"].astype(str)
-        split_coords = coords_raw.str.split(",", n=1, expand=True)
-        unified_df["Lat"] = split_coords[0].str.strip()
-        unified_df["Long"] = split_coords[1].str.strip() if split_coords.shape[1] > 1 else pd.NA
-        unified_df.loc[coords_raw.isna(), ["Lat", "Long"]] = pd.NA
-    elif "_TEMP_LAT_RAW" in unified_df.columns and "_TEMP_LONG_RAW" in unified_df.columns:
-        unified_df["Lat"] = unified_df["_TEMP_LAT_RAW"]
-        unified_df["Long"] = unified_df["_TEMP_LONG_RAW"]
-
-    return unified_df
-
-
-def _drop_temp_coord_cols(unified):
-    return unified.drop(columns=[c for c in ["_TEMP_COORDINATES_RAW", "_TEMP_LAT_RAW", "_TEMP_LONG_RAW"] if c in unified.columns])
-
-
-def parse_merged_status(df, mapping, sheet_name):
-    """The original tracker layout: each project spans several rows, only
-    the first row of a block has the group key populated, and status is a
-    TRUE/FALSE column paired with a status-label column."""
-    status_col = mapping.get("Project status")
-    if not status_col or status_col not in df.columns:
-        return pd.DataFrame(columns=OUTPUT_SCHEMA)
-
-    cols = list(df.columns)
-    status_idx = cols.index(status_col)
-    if status_idx + 1 >= len(cols):
-        return pd.DataFrame(columns=OUTPUT_SCHEMA)
-    label_col = cols[status_idx + 1]
-
-    group_key_col = mapping.get("Project Title") or df.columns[0]
-    is_new_group = df[group_key_col].notna() & (df[group_key_col].astype(str).str.strip() != "")
-    df = df.copy()
+    # Each project spans several rows; only the first row of a block has
+    # the group key populated. Forward-fill the shared fields within a
+    # block so every row carries the full project context.
+    is_new_group = df[GROUP_KEY_COL].notna() & (df[GROUP_KEY_COL].astype(str).str.strip() != "")
     df["_group_id"] = is_new_group.cumsum()
 
-    shared_cols = [c for c in cols if c not in (status_col, label_col)]
+    shared_cols = [c for c in original_cols if c not in (STATUS_BOOL_COL, status_label_col)]
     df[shared_cols] = df.groupby("_group_id")[shared_cols].ffill()
-    df["_status_bool"] = df[status_col].map(BOOL_MAP)
+    df["_status_bool"] = df[STATUS_BOOL_COL].map(BOOL_MAP)
 
-    processed_records = []
-    for gid, g in df.groupby("_group_id"):
-        first_row = g.iloc[0]
-        record = {}
+    records = []
+    for _, group in df.groupby("_group_id"):
+        base = group.iloc[0][shared_cols].to_dict()
+        onehot = {label: 0 for label in STATUS_LABELS}
 
-        for label in STATUS_LABELS:
-            record[label] = 0
+        for _, row in group.iterrows():
+            label = str(row[status_label_col]).strip()
+            if label in onehot and row["_status_bool"] is True:
+                onehot[label] = 1
 
-        for field in OUTPUT_SCHEMA:
-            if field == "No.":
-                record[field] = pd.NA
-            elif field == "Division":
-                record[field] = first_row.get(mapping["Division"]) if mapping.get("Division") else sheet_name
-            elif field in STATUS_LABELS:
-                continue
-            elif field in ("Lat", "Long"):
-                continue
-            elif field == "Source Sheet":
-                record[field] = sheet_name
-            else:
-                original_col_name = mapping.get(field)
-                record[field] = first_row.get(original_col_name) if original_col_name and original_col_name in first_row.index else pd.NA
+        base.update(onehot)
+        records.append(base)
 
-        for _, row in g.iterrows():
-            label = str(row[label_col]).strip()
-            if label in STATUS_LABELS and row["_status_bool"] is True:
-                record[label] = 1
+    result = pd.DataFrame(records)
 
-        if "Coordinates" in mapping:
-            record["_TEMP_COORDINATES_RAW"] = first_row.get(mapping["Coordinates"])
-        if "Lat" in mapping:
-            record["_TEMP_LAT_RAW"] = first_row.get(mapping["Lat"])
-        if "Long" in mapping:
-            record["_TEMP_LONG_RAW"] = first_row.get(mapping["Long"])
+    if COORDINATES_COL in result.columns:
+        split_coords = result[COORDINATES_COL].astype(str).str.split(",", n=1, expand=True)
+        result["Lat"] = pd.to_numeric(split_coords[0].str.strip(), errors="coerce")
+        long_values = split_coords[1].str.strip() if split_coords.shape[1] > 1 else pd.NA
+        result["Long"] = pd.to_numeric(long_values, errors="coerce")
+    else:
+        result["Lat"] = pd.NA
+        result["Long"] = pd.NA
 
-        processed_records.append(record)
-
-    if not processed_records:
-        return pd.DataFrame(columns=OUTPUT_SCHEMA)
-
-    unified = pd.DataFrame(processed_records)
-    for col in OUTPUT_SCHEMA:
-        if col not in unified.columns:
-            unified[col] = pd.NA
-
-    unified = populate_coordinates_from_temp(unified)
-    unified = _drop_temp_coord_cols(unified)
-    return unified[OUTPUT_SCHEMA]
-
-
-def parse_section_headers(df, mapping, sheet_name):
-    """The new print-style layout: no separate sheet per division. Instead
-    a bare row (title blank, first column filled, e.g. 'CEST PROGRAM')
-    marks the start of a division block; subtotal/signature rows are
-    skipped via STOP_MARKERS."""
-    title_col = mapping.get("Project Title")
-    if not title_col or title_col not in df.columns:
-        return pd.DataFrame(columns=OUTPUT_SCHEMA)
-
-    first_col = df.columns[0]
-    processed_records = []
-    current_division = sheet_name
-
-    for _, row in df.iterrows():
-        row_text = " ".join(str(v) for v in row.values if pd.notna(v)).lower()
-        if any(marker in row_text for marker in STOP_MARKERS):
-            continue
-
-        title_val = row.get(title_col)
-        has_title = isinstance(title_val, str) and title_val.strip() != ""
-        first_val = row.get(first_col)
-        first_str = str(first_val).strip() if pd.notna(first_val) else ""
-
-        if not has_title and first_str != "":
-            current_division = first_str
-            continue
-        if not has_title:
-            continue
-
-        record = {}
-        for field in OUTPUT_SCHEMA:
-            if field == "No.":
-                record[field] = pd.NA
-            elif field == "Division":
-                record[field] = current_division
-            elif field in STATUS_LABELS:
-                record[field] = pd.NA
-            elif field in ("Lat", "Long"):
-                continue
-            elif field == "Source Sheet":
-                record[field] = sheet_name
-            else:
-                original_col_name = mapping.get(field)
-                record[field] = row.get(original_col_name) if original_col_name else pd.NA
-
-        if "Coordinates" in mapping:
-            record["_TEMP_COORDINATES_RAW"] = row.get(mapping["Coordinates"])
-        if "Lat" in mapping:
-            record["_TEMP_LAT_RAW"] = row.get(mapping["Lat"])
-        if "Long" in mapping:
-            record["_TEMP_LONG_RAW"] = row.get(mapping["Long"])
-
-        processed_records.append(record)
-
-    if not processed_records:
-        return pd.DataFrame(columns=OUTPUT_SCHEMA)
-
-    unified = pd.DataFrame(processed_records)
-    for col in OUTPUT_SCHEMA:
-        if col not in unified.columns:
-            unified[col] = pd.NA
-
-    unified = populate_coordinates_from_temp(unified)
-    unified = _drop_temp_coord_cols(unified)
-    return unified[OUTPUT_SCHEMA]
-
-
-def parse_flat(df, mapping, sheet_name):
-    """Fallback: already one clean row per project, no blocks and no
-    section dividers to collapse."""
-    title_col = mapping.get("Project Title")
-    if not title_col or title_col not in df.columns:
-        return pd.DataFrame(columns=OUTPUT_SCHEMA)
-
-    df_filtered = df[df[title_col].notna() & (df[title_col].astype(str).str.strip() != "")].copy()
-    if df_filtered.empty:
-        return pd.DataFrame(columns=OUTPUT_SCHEMA)
-
-    unified_data = {}
-    for field in OUTPUT_SCHEMA:
-        if field == "No.":
-            unified_data[field] = pd.NA
-        elif field == "Division":
-            unified_data[field] = df_filtered[mapping["Division"]] if mapping.get("Division") else sheet_name
-        elif field in STATUS_LABELS:
-            unified_data[field] = pd.NA
-        elif field in ("Lat", "Long"):
-            continue
-        elif field == "Source Sheet":
-            unified_data[field] = sheet_name
-        else:
-            original_col_name = mapping.get(field)
-            unified_data[field] = df_filtered[original_col_name] if original_col_name and original_col_name in df_filtered.columns else pd.NA
-
-    unified = pd.DataFrame(unified_data, index=df_filtered.index)
-
-    if "Coordinates" in mapping:
-        unified["_TEMP_COORDINATES_RAW"] = df_filtered.get(mapping["Coordinates"])
-    if "Lat" in mapping:
-        unified["_TEMP_LAT_RAW"] = df_filtered.get(mapping["Lat"])
-    if "Long" in mapping:
-        unified["_TEMP_LONG_RAW"] = df_filtered.get(mapping["Long"])
-
-    unified = populate_coordinates_from_temp(unified)
-    unified = _drop_temp_coord_cols(unified)
-    return unified[OUTPUT_SCHEMA]
-
-
-def normalize_division(name):
-    if not isinstance(name, str):
-        return name
-    return DIVISION_NORMALIZATION.get(name.strip().upper(), name.strip())
+    result.insert(0, "Division", sheet_name)
+    return result
 
 
 def _assign_map_status(row):
-    """Collapse the one-hot status columns into a single display label.
-    Data sources that don't carry status at all (e.g. the cost-list
-    format) leave all three as NA, which correctly falls through here."""
+    """Collapse the one-hot status columns into a single display label."""
     for label in STATUS_LABELS:
-        value = row.get(label)
-        if pd.notna(value) and value == 1:
+        if row.get(label) == 1:
             return label
     return "Unknown"
-
-
-def _compute_effective_funding(row):
-    """Prefer the Revised amount when present and non-zero; otherwise fall
-    back to the Original amount."""
-    for col in (AMOUNT_REVISED_COL, AMOUNT_ORIGINAL_COL):
-        raw = row.get(col)
-        if pd.isna(raw):
-            continue
-        try:
-            val = float(str(raw).replace(",", "").strip())
-        except (ValueError, TypeError):
-            continue
-        if val != 0:
-            return val
-    return pd.NA
-
-
-def _is_visible_sheet(ws):
-    """Excel sheet_state is 'visible', 'hidden', or 'veryHidden'. Only
-    sheets someone can actually see in Excel should be treated as
-    candidate data -- a hidden sheet is usually a working copy, an old
-    snapshot, or a scratch calculation, not the current source of truth."""
-    return ws.sheet_state == "visible"
-
-
-def process_workbook(uploaded_file, sheet_filter=None):
-    """Scan every visible sheet (or only those in sheet_filter), auto-detect
-    each sheet's layout, and normalize everything to OUTPUT_SCHEMA. Hidden
-    and very-hidden sheets are always skipped.
-
-    sheet_filter: optional iterable of sheet names to restrict scanning to
-    (used by Legacy Tracker mode). None scans every visible sheet in the
-    workbook.
-    """
-    file_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-    all_results = []
-
-    for sheet_name in wb.sheetnames:
-        if sheet_filter is not None and sheet_name not in sheet_filter:
-            continue
-
-        ws = wb[sheet_name]
-        if not _is_visible_sheet(ws):
-            continue
-
-        header_row = find_header_row(ws)
-        if header_row is None:
-            continue
-
-        df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=header_row - 1, dtype=str)
-        df.columns = [str(c).strip() for c in df.columns]
-        mapping = map_headers(list(df.columns))
-
-        if "Project Title" not in mapping:
-            continue
-
-        structure = detect_structure(df, mapping)
-
-        if structure == "merged_status":
-            unified = parse_merged_status(df, mapping, sheet_name)
-        elif structure == "section_headers":
-            unified = parse_section_headers(df, mapping, sheet_name)
-        else:
-            unified = parse_flat(df, mapping, sheet_name)
-
-        if unified.empty:
-            continue
-
-        unified["Division"] = unified["Division"].apply(normalize_division)
-        all_results.append(unified)
-
-    if not all_results:
-        return pd.DataFrame(columns=OUTPUT_SCHEMA)
-
-    combined = pd.concat(all_results, ignore_index=True)
-    combined["No."] = combined.groupby("Division").cumcount() + 1
-    return combined[OUTPUT_SCHEMA]
-
-
-@st.cache_data
-def list_candidate_sheets(uploaded_file):
-    """Return every VISIBLE sheet name in the workbook that has a
-    recognizable project-list header row. Used to build the snapshot/sheet
-    picker for Cost List / Any Template mode, since a workbook can contain
-    several dated snapshots of the same projects rather than one sheet per
-    division -- and often also hidden working copies that shouldn't be
-    offered as choices at all."""
-    file_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
-    candidates = []
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        if _is_visible_sheet(ws) and find_header_row(ws) is not None:
-            candidates.append(sheet_name)
-    return candidates
 
 
 @st.cache_data
@@ -544,7 +163,7 @@ def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
     combined["Lat"] = pd.to_numeric(combined["Lat"], errors="coerce")
     combined["Long"] = pd.to_numeric(combined["Long"], errors="coerce")
     combined["Map_Status"] = combined.apply(_assign_map_status, axis=1)
-    combined[EFFECTIVE_FUNDING_COL] = combined.apply(_compute_effective_funding, axis=1)
+    combined = combined.dropna(subset=["Lat", "Long"])
 
     return combined
 
@@ -1268,18 +887,15 @@ def render_project_details_content(clicked_projects):
         division = str(row.get("Division", "N/A"))
         status = str(row.get("Map_Status", "Unknown"))
         
-        funding_raw = row.get(EFFECTIVE_FUNDING_COL, "Not specified")
+        funding_raw = row.get(FUNDING_COL, "Not specified")
         try:
             funding_val = float(str(funding_raw).replace(',', ''))
             display_funding = f"₱{funding_val:,.2f}" if funding_val % 1 != 0 else f"₱{int(funding_val):,}"
-        except (ValueError, TypeError):
+        except ValueError:
             display_funding = f"₱{funding_raw}" if funding_raw != "Not specified" else "Not specified"
 
         agency = row.get("Implementing Agency", "Not specified")
         proponent = str(row.get("Name of Proponent", "Not specified"))
-        coordinator = clean_missing(row.get("DOST Coordinator", "Not specified"))
-        location = clean_missing(row.get("Location", "Not specified"))
-        beneficiaries = clean_missing(row.get("Beneficiaries", "Not specified"))
         remarks = str(row.get("Remarks", "No remarks provided."))
 
         date_approved = clean_missing(row.get(DATE_APPROVED_COL, "Not specified"))
@@ -1293,16 +909,10 @@ def render_project_details_content(clicked_projects):
             st.markdown(f"**🏢 Agency:** {agency}")
             st.markdown(f"**👤 Proponent:** {proponent}")
             st.markdown(f"**💰 Funding:** {display_funding}")
-            if coordinator != "Not specified":
-                st.markdown(f"**🧑‍💼 DOST Coordinator:** {coordinator}")
         with col2:
             # [:10] strips any trailing " 00:00:00" timestamp from date strings.
             st.markdown(f"**📅 Date Approved:** {date_approved[:10]}")
             st.markdown(f"**🏁 End/Target Date:** {date_end[:10]}")
-            if location != "Not specified":
-                st.markdown(f"**📍 Location:** {location}")
-            if beneficiaries != "Not specified":
-                st.markdown(f"**🎯 Beneficiaries:** {beneficiaries}")
 
         st.info(f"**Remarks:** {remarks}")
         st.divider()
@@ -1493,15 +1103,14 @@ def format_export_data(df):
     export_df = df.copy()
     
     # 1. Drop internal logic & redundant columns
-    cols_to_drop = list(STATUS_LABELS) + ["Source Sheet"]
+    cols_to_drop = [COORDINATES_COL, "_group_id", "_status_bool"] + STATUS_LABELS
     export_df = export_df.drop(columns=[c for c in cols_to_drop if c in export_df.columns])
     
     # 2. Rename columns for professionalism
     rename_map = {
         "Map_Status": "Status",
         "Lat": "Latitude",
-        "Long": "Longitude",
-        EFFECTIVE_FUNDING_COL: "Funding (Effective)",
+        "Long": "Longitude"
     }
     export_df = export_df.rename(columns=rename_map)
     
@@ -1592,8 +1201,11 @@ def render_filters(clean_df, pin_style, enable_clustering, show_legend, scale_by
                     
                 filtered_df = filtered_df[date_mask]
 
-    if EFFECTIVE_FUNDING_COL in clean_df.columns:
-        funding_numeric = pd.to_numeric(clean_df[EFFECTIVE_FUNDING_COL], errors="coerce")
+    if FUNDING_COL in clean_df.columns:
+        funding_numeric = pd.to_numeric(
+            clean_df[FUNDING_COL].astype(str).str.replace(",", "", regex=False),
+            errors="coerce"
+        )
         valid_funding = funding_numeric.dropna()
         
         if not valid_funding.empty:
@@ -1611,7 +1223,10 @@ def render_filters(clean_df, pin_style, enable_clustering, show_legend, scale_by
                 
                 include_missing_budget = st.sidebar.checkbox("Include projects with missing budget", value=True)
                 
-                filtered_funding = pd.to_numeric(filtered_df[EFFECTIVE_FUNDING_COL], errors="coerce")
+                filtered_funding = pd.to_numeric(
+                    filtered_df[FUNDING_COL].astype(str).str.replace(",", "", regex=False),
+                    errors="coerce"
+                )
                 
                 budget_mask = (filtered_funding >= budget_range[0]) & (filtered_funding <= budget_range[1])
                 if include_missing_budget:
@@ -1666,8 +1281,11 @@ def render_kpi_scorecards(filtered_df):
         st.metric(label="🛑 Terminated", value=terminated_count)
 
     with kpi5:
-        if EFFECTIVE_FUNDING_COL in filtered_df.columns:
-            total_funding = pd.to_numeric(filtered_df[EFFECTIVE_FUNDING_COL], errors="coerce").sum()
+        if FUNDING_COL in filtered_df.columns:
+            total_funding = pd.to_numeric(
+                filtered_df[FUNDING_COL].astype(str).str.replace(",", "", regex=False),
+                errors="coerce",
+            ).sum()
             formatted_funding = format_currency(total_funding)
         else:
             formatted_funding = "N/A"
@@ -1728,11 +1346,8 @@ def generate_executive_summary(ollama_url, df):
     total_projects = len(clean_df)
     status_counts = clean_df['Status'].value_counts().to_dict() if 'Status' in clean_df.columns else {}
     
-    # Prefer the canonical effective-funding figure (Revised if present, else
-    # Original); only fall back to keyword sniffing if it's missing.
-    funding_col = "Funding (Effective)" if "Funding (Effective)" in clean_df.columns else next(
-        (c for c in clean_df.columns if 'fund' in c.lower() or 'cost' in c.lower() or 'amount' in c.lower()), None
-    )
+    # Attempt to find a funding column to sum
+    funding_col = next((c for c in clean_df.columns if 'fund' in c.lower() or 'cost' in c.lower() or 'amount' in c.lower()), None)
     total_funding = 0
     if funding_col:
         total_funding = pd.to_numeric(clean_df[funding_col].astype(str).str.replace(r'[^\d.]', '', regex=True), errors='coerce').sum()
