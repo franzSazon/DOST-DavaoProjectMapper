@@ -51,7 +51,7 @@ OUTPUT_SCHEMA = [
     AMOUNT_ORIGINAL_COL, AMOUNT_REVISED_COL,
     DATE_APPROVED_COL, DATE_END_COL,
     "Ongoing", "Completed", "Terminated",
-    "Remarks", "Lat", "Long", "Source Sheet",
+    "Remarks", "Lat", "Long", "Source Sheet", "Coordinate_Source"
 ]
 
 # (canonical_field, [keyword fragments to match against a lowercased,
@@ -637,6 +637,11 @@ def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
     combined["Map_Status"] = combined.apply(_assign_map_status, axis=1)
     combined[EFFECTIVE_FUNDING_COL] = combined.apply(_compute_effective_funding, axis=1)
 
+    if "Coordinate_Source" not in combined.columns:
+        combined["Coordinate_Source"] = pd.NA
+    mask_original = combined["Lat"].notna() & combined["Long"].notna() & combined["Coordinate_Source"].isna()
+    combined.loc[mask_original, "Coordinate_Source"] = "Original"
+
     return combined
 
 
@@ -776,6 +781,7 @@ def resolve_missing_coordinates(df, api_token):
         if coords:
             df.at[idx, "Lat"] = coords[0]
             df.at[idx, "Long"] = coords[1]
+            df.at[idx, "Coordinate_Source"] = "Mapbox"
         else:
             failures.append({
                 "Project Title": row.get("Project Title", "Untitled"),
@@ -1326,6 +1332,11 @@ st.markdown("""
             align-self: flex-start !important; /* Anchor it to the top if it's a flex container */
         }
 
+        /* Force the map iframe inside the dialog to expand vertically to 85% of the screen */
+        div[data-testid="stDialog"] [role="dialog"] iframe {
+            height: 85vh !important;
+        }
+
     </style>
 """, unsafe_allow_html=True)
  
@@ -1405,6 +1416,73 @@ def show_project_details(clicked_projects):
     render_project_details_content(clicked_projects)
 
 
+@st.dialog("📍 Edit All Coordinates", width="large")
+def show_coordinate_editor(working_df):
+    """Provide a tabular interface to manually fix auto-generated or original coordinates."""
+    st.write("Edit the 'Lat' and 'Long' directly in the table below, or paste a 'Lat, Long' string into the 'Paste Coordinates' column.")
+    
+    if "Coordinate_Source" not in working_df.columns:
+        working_df["Coordinate_Source"] = pd.NA
+        
+    # Create an editable copy of the dataframe
+    edit_df = working_df[["Division", "Project Title", "Implementing Agency", "Location", "Coordinate_Source", "Lat", "Long"]].copy()
+    edit_df["Paste Coordinates"] = ""
+    
+    edited_df = st.data_editor(
+        edit_df,
+        disabled=["Division", "Project Title", "Implementing Agency", "Location", "Coordinate_Source"],
+        width='stretch',
+        hide_index=True,
+        key="coord_editor"
+    )
+    
+    if st.button("Save Changes", type="primary"):
+        changes_made = False
+        
+        for idx, row in edited_df.iterrows():
+            pasted = str(row.get("Paste Coordinates", "")).strip()
+            new_lat = row["Lat"]
+            new_lon = row["Long"]
+            updated = False
+            
+            # If they pasted a string, parse it
+            if pasted:
+                try:
+                    parts = pasted.strip("() ").split(",")
+                    if len(parts) == 2:
+                        new_lat = float(parts[0].strip())
+                        new_lon = float(parts[1].strip())
+                        updated = True
+                except Exception:
+                    st.error(f"Failed to parse pasted coordinates for '{row['Project Title']}'. Please use 'Lat, Long' format.")
+                    return
+            
+            original_lat = working_df.at[idx, "Lat"]
+            original_lon = working_df.at[idx, "Long"]
+            
+            # Safe comparison for float/NaN
+            def is_same(a, b):
+                if pd.isna(a) and pd.isna(b):
+                    return True
+                return a == b
+            
+            # If directly edited in the table
+            if not is_same(new_lat, original_lat) or not is_same(new_lon, original_lon):
+                updated = True
+                
+            if updated:
+                working_df.at[idx, "Lat"] = new_lat
+                working_df.at[idx, "Long"] = new_lon
+                working_df.at[idx, "Coordinate_Source"] = "Manual Override"
+                changes_made = True
+                
+        if changes_made:
+            st.session_state["working_df"] = working_df
+            st.success("Coordinates updated successfully!")
+            time.sleep(1) # Let the user see the success message
+            st.rerun()
+
+
 @st.dialog("📊 Raw Data Explorer", width="large")
 def show_raw_data(df):
     """Display the filtered dataset in a plain, sortable table."""
@@ -1419,8 +1497,8 @@ def show_fullscreen_map(df, pin_style, enable_clustering, show_legend, scale_by_
     map_key = f"fullscreen_map_{show_legend}_{enable_clustering}_{pin_style}_{scale_by_funding}"
     map_data = st_folium(
         project_map,
-        use_container_width=True,
-        height=570,
+        width='stretch',
+        height=800, # Fallback height, heavily overridden by the 85vh CSS above
         returned_objects=["last_object_clicked"],
         key=map_key
     )
@@ -1610,7 +1688,7 @@ def format_export_data(df):
     current_cols = list(export_df.columns)
     
     # Pull out our target columns so we can safely reposition them
-    target_order = ["Status", "Remarks", "Latitude", "Longitude"]
+    target_order = ["Status", "Remarks", "Latitude", "Longitude", "Coordinate_Source"]
     for col in target_order:
         if col in current_cols:
             current_cols.remove(col)
@@ -1637,6 +1715,8 @@ def render_filters(clean_df, pin_style, enable_clustering, show_legend, scale_by
     """Render the sidebar filter controls and return the filtered DataFrame."""
     st.sidebar.header("🔍 Filter Dashboard")
 
+    search_query = st.sidebar.text_input("Search Project Title:", value="")
+
     available_divisions = clean_df["Division"].unique().tolist()
     selected_divisions = st.sidebar.multiselect(
         "Select Project(s):", available_divisions, default=available_divisions
@@ -1651,6 +1731,10 @@ def render_filters(clean_df, pin_style, enable_clustering, show_legend, scale_by
         clean_df["Division"].isin(selected_divisions)
         & clean_df["Map_Status"].isin(selected_statuses)
     ]
+
+    if search_query:
+        if "Project Title" in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df["Project Title"].astype(str).str.contains(search_query, case=False, na=False)]
 
     if DATE_APPROVED_COL in clean_df.columns:
         approval_dates = pd.to_datetime(clean_df[DATE_APPROVED_COL], errors="coerce")
@@ -2062,6 +2146,7 @@ if uploaded_file is not None:
 
     working_df = st.session_state["working_df"]
     missing_coords_count = int((working_df["Lat"].isna() | working_df["Long"].isna()).sum())
+    st.sidebar.divider()
     st.sidebar.header("📍 Missing Coordinates")
     if missing_coords_count == 0:
         st.sidebar.caption("Every project has coordinates.")
@@ -2101,6 +2186,10 @@ if uploaded_file is not None:
                 "Implementing Agency text and re-run."
             )
 
+    st.sidebar.subheader("Coordinate Validation")
+    if st.sidebar.button("Edit All Coordinates", width="stretch"):
+        show_coordinate_editor(working_df)
+
     mappable_df = working_df.dropna(subset=["Lat", "Long"])
 
 
@@ -2136,7 +2225,7 @@ if uploaded_file is not None:
     map_key = f"main_map_{show_legend}_{enable_clustering}_{pin_style}_{scale_by_funding}"
     map_data = st_folium(
         project_map,
-        use_container_width=True,
+        width='stretch',
         height=460,
         returned_objects=["last_object_clicked"],
         key=map_key,
@@ -2146,7 +2235,7 @@ if uploaded_file is not None:
 
     col1, col2 = st.columns([0.85, 0.15])
     with col2:
-        if st.button("🔍 Maximize Map", use_container_width=True):
+        if st.button("🔍 Maximize Map", width="stretch"):
             show_fullscreen_map(filtered_df, pin_style, enable_clustering, show_legend, scale_by_funding)
 
     # (Removed original high-res export block from main body)
