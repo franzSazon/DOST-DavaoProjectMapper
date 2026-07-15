@@ -134,6 +134,7 @@ OLLAMA_MODEL = "llama3.2:3b"
 INGESTION_MODES = {
     "Division-Based Template": "legacy",
     "General Template": "auto",
+    "Plain CSV Upload": "csv",
 }
 
 
@@ -437,6 +438,86 @@ def _is_visible_sheet(ws):
     return ws.sheet_state == "visible"
 
 
+def is_csv_upload(uploaded_file):
+    """True if the uploaded file is a .csv rather than an .xlsx workbook,
+    based on the filename Streamlit's file_uploader gives us. CSVs have no
+    concept of sheets/hidden-sheets/header-row-scanning, so they get a
+    dedicated ingestion path instead of going through openpyxl at all."""
+    name = getattr(uploaded_file, "name", "") or ""
+    return name.lower().endswith(".csv")
+
+
+# Columns that only ever appear in this platform's own CSV export (see
+# format_export_data's rename_map) -- used to detect a "loopback"
+# re-upload of a file this app produced, so it can be mapped straight
+# back onto OUTPUT_SCHEMA instead of running through generic detection.
+OWN_EXPORT_SIGNATURE_COLUMNS = {"Latitude", "Longitude", "Status"}
+
+
+def _reverse_own_export_csv(df):
+    """Map this platform's own exported CSV (see format_export_data)
+    straight back onto OUTPUT_SCHEMA. Critically, 'Latitude'/'Longitude'
+    rename directly back to 'Lat'/'Long' so coordinates that were already
+    geocoded are preserved as-is and never re-sent to the geocoder --
+    that's the whole point of a loopback path."""
+    df = df.rename(columns={"Latitude": "Lat", "Longitude": "Long"})
+
+    # Reverse the single 'Status' text column back into the one-hot
+    # Ongoing/Completed/Terminated columns OUTPUT_SCHEMA expects.
+    # Anything that doesn't match a known label (including 'Unknown')
+    # stays NA on all three, which _assign_map_status already reads back
+    # out as 'Unknown' -- same convention the cost-list format uses.
+    for label in STATUS_LABELS:
+        df[label] = pd.NA
+    if "Status" in df.columns:
+        status_text = df["Status"].astype(str)
+        for label in STATUS_LABELS:
+            df.loc[status_text == label, label] = 1
+
+    df["Source Sheet"] = "CSV Re-import"
+
+    for col in OUTPUT_SCHEMA:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    df["Division"] = df["Division"].apply(normalize_division)
+    return df[OUTPUT_SCHEMA]
+
+
+def process_csv(uploaded_file):
+    """Task 9.6: native CSV ingestion, bypassing openpyxl/Excel structural
+    detection entirely.
+
+    If the CSV matches this platform's own export signature (Latitude /
+    Longitude / Status columns), it's a loopback re-upload and gets mapped
+    straight back onto OUTPUT_SCHEMA via _reverse_own_export_csv,
+    preserving any already-geocoded coordinates.
+
+    Otherwise it's treated as a generic flat, one-row-per-project CSV and
+    run through the exact same FIELD_ALIASES header mapping used for
+    Excel files, reusing parse_flat -- so there's no separate ingestion
+    codebase for CSVs, just a different entry point into the same
+    mapping/parsing logic.
+    """
+    file_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    df = pd.read_csv(io.BytesIO(file_bytes), dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if OWN_EXPORT_SIGNATURE_COLUMNS.issubset(set(df.columns)):
+        return _reverse_own_export_csv(df)
+
+    mapping = map_headers(list(df.columns))
+    if "Project Title" not in mapping:
+        return pd.DataFrame(columns=OUTPUT_SCHEMA)
+
+    unified = parse_flat(df, mapping, sheet_name="CSV Upload")
+    if unified.empty:
+        return unified
+
+    unified["Division"] = unified["Division"].apply(normalize_division)
+    return unified[OUTPUT_SCHEMA]
+
+
 def process_workbook(uploaded_file, sheet_filter=None):
     """Scan every visible sheet (or only those in sheet_filter), auto-detect
     each sheet's layout, and normalize everything to OUTPUT_SCHEMA. Hidden
@@ -512,7 +593,7 @@ def list_candidate_sheets(uploaded_file):
 
 @st.cache_data
 def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
-    """Ingest the workbook under the chosen mode and finish deriving the
+    """Ingest the file under the chosen mode and finish deriving the
     fields the rest of the app relies on (numeric Lat/Long, a single
     display status, a single effective funding figure).
 
@@ -523,20 +604,30 @@ def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
     has had a chance to fill gaps in. Rows without status simply display
     as 'Unknown'.
 
-    In Legacy Tracker mode, every CEST/LGIA/SSCP sheet is combined (they
-    are genuinely different divisions). In Cost List / Any Template mode,
-    only `selected_sheet` is loaded -- a workbook in this format is often
-    several dated snapshots of the *same* projects, not separate
-    divisions, so combining all sheets would multiply-count every project.
-    """
-    if ingestion_mode == "legacy":
-        sheet_filter = DATA_SHEETS
-    elif selected_sheet is not None:
-        sheet_filter = [selected_sheet]
-    else:
-        sheet_filter = None
+    CSV uploads (Task 9.6) go through process_csv, which bypasses the
+    Excel-oriented sheet/structure detection entirely -- either reversing
+    this platform's own export format straight back onto OUTPUT_SCHEMA
+    (preserving already-geocoded coordinates), or falling back to the
+    same generic flat-file parser Excel files use.
 
-    combined = process_workbook(uploaded_file, sheet_filter=sheet_filter)
+    For Excel uploads: in Legacy Tracker mode, every CEST/LGIA/SSCP sheet
+    is combined (they are genuinely different divisions). In Cost List /
+    Any Template mode, only `selected_sheet` is loaded -- a workbook in
+    this format is often several dated snapshots of the *same* projects,
+    not separate divisions, so combining all sheets would multiply-count
+    every project.
+    """
+    if ingestion_mode == "csv":
+        combined = process_csv(uploaded_file)
+    else:
+        if ingestion_mode == "legacy":
+            sheet_filter = DATA_SHEETS
+        elif selected_sheet is not None:
+            sheet_filter = [selected_sheet]
+        else:
+            sheet_filter = None
+
+        combined = process_workbook(uploaded_file, sheet_filter=sheet_filter)
 
     if combined.empty:
         return combined
@@ -1449,20 +1540,30 @@ data_format_label = st.sidebar.radio(
     options=list(INGESTION_MODES.keys()),
     index=0,
     help=(
-        "Select the option that matches your Excel file.\n\n"
-        "• Division-Based Template – For files organized into separate "
+        "Select the option that matches your data file.\n\n"
+        "• Division-Based Template – For Excel files organized into separate "
         "CEST, LGIA, and SSCP worksheets.\n\n"
         "• General Template – For project lists, project cost reports, "
         "and other supported DOST Excel templates. The application will "
         "automatically recognize the file format.\n\n"
+        "• Plain CSV Upload – For .csv files. If it's a file this app exported "
+        "earlier, its coordinates and data are read back in directly. Otherwise it's treated as a generic one-row-per-project file.\n\n"
         "Note: Only projects with valid coordinates can be displayed on the map."
     ),
 )
 ingestion_mode = INGESTION_MODES[data_format_label]
 
+if ingestion_mode == "csv":
+    file_type = ["csv"]
+    file_help = "Upload a .csv file."
+else:
+    file_type = ["xlsx"]
+    file_help = "Upload an Excel file (.xlsx)."
+
 uploaded_file = st.sidebar.file_uploader(
-    "Upload DOST-Davao Excel File (.xlsx)",
-    type=["xlsx"],
+    "Upload File",
+    type=file_type,
+    help=file_help,
 )
 
 selected_sheet = None
