@@ -7,17 +7,18 @@ A Streamlit application for the Department of Science and Technology - Davao Reg
 ## Features
 
 ### Data Ingestion
-- Two ingestion modes: **Division-Based Template** (separate CEST/LGIA/SSCP sheets) and **General Template** (auto-detects header rows and project sections in other layouts).
+- Three ingestion modes: **Division-Based Template** (separate CEST/LGIA/SSCP sheets), **General Template** (auto-detects header rows and project sections in other layouts), and **Plain CSV Upload** (generic one-row-per-project CSV files, including CSVs previously exported by this app).
 - Maps inconsistent source column headers (for example "Amount of Funding", "Project Cost", "Revised") to a single canonical schema.
 - Normalizes division names, project status, and funding amounts (original and revised) across sheets.
 
 ### Mapping
 - Displays projects on a Folium map centered on Davao, with marker clustering, division-based color coding, and configurable pin styles.
 - Resolves missing coordinates using the Mapbox Geocoding API based on project location and beneficiary data.
+- Provides a manual coordinate editor to correct or fill in a project's Lat/Long directly in a table, or by pasting a "Lat, Long" string.
 - Clicking a marker opens a panel with project details: funding, timeline, proponent, and status.
 
 ### Filters and KPIs
-- Sidebar filters for division, project status, approval date range, and budget range, with options to include or exclude records with missing values.
+- Sidebar filters for project title search, division, project status, approval date range, and budget range, with options to include or exclude records with missing values.
 - KPI scorecards summarizing the currently filtered project set (counts, funding totals, status breakdown).
 - Raw data table view of the cleaned dataset.
 - CSV export of the filtered results.
@@ -58,9 +59,9 @@ A Streamlit application for the Department of Science and Technology - Davao Reg
 
 ## Usage
 
-1. Select the ingestion mode that matches your workbook (Division-Based Template or General Template).
-2. Upload the project Excel file in the sidebar.
-3. Use the filters to narrow projects by division, status, date, or budget.
+1. Select the ingestion mode that matches your file (Division-Based Template, General Template, or Plain CSV Upload).
+2. Upload the project Excel or CSV file in the sidebar.
+3. Use the filters to narrow projects by title, division, status, date, or budget.
 4. Click markers on the map for project details, check the KPI scorecards, and export data as CSV or a map image.
 5. Optionally, generate an AI summary or ask questions about the filtered dataset.
 
