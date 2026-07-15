@@ -1313,14 +1313,6 @@ st.markdown("""
             background-color: #FFFFFF !important;
         }
 
-        .st-g9 {
-            background-color: #FFFFFF !important;
-        }
-
-        .st-emotion-cache-yiekhv {
-            background-color: #FFFFFF !important;
-        }
-
         /* ==========================================
            13. SLIDER TWEAKS
            ========================================== */
