@@ -51,7 +51,7 @@ OUTPUT_SCHEMA = [
     AMOUNT_ORIGINAL_COL, AMOUNT_REVISED_COL,
     DATE_APPROVED_COL, DATE_END_COL,
     "Ongoing", "Completed", "Terminated",
-    "Remarks", "Lat", "Long", "Source Sheet",
+    "Remarks", "Lat", "Long", "Source Sheet", "Coordinate_Source"
 ]
 
 # (canonical_field, [keyword fragments to match against a lowercased,
@@ -134,6 +134,7 @@ OLLAMA_MODEL = "llama3.2:3b"
 INGESTION_MODES = {
     "Division-Based Template": "legacy",
     "General Template": "auto",
+    "Plain CSV Upload": "csv",
 }
 
 
@@ -437,6 +438,86 @@ def _is_visible_sheet(ws):
     return ws.sheet_state == "visible"
 
 
+def is_csv_upload(uploaded_file):
+    """True if the uploaded file is a .csv rather than an .xlsx workbook,
+    based on the filename Streamlit's file_uploader gives us. CSVs have no
+    concept of sheets/hidden-sheets/header-row-scanning, so they get a
+    dedicated ingestion path instead of going through openpyxl at all."""
+    name = getattr(uploaded_file, "name", "") or ""
+    return name.lower().endswith(".csv")
+
+
+# Columns that only ever appear in this platform's own CSV export (see
+# format_export_data's rename_map) -- used to detect a "loopback"
+# re-upload of a file this app produced, so it can be mapped straight
+# back onto OUTPUT_SCHEMA instead of running through generic detection.
+OWN_EXPORT_SIGNATURE_COLUMNS = {"Latitude", "Longitude", "Status"}
+
+
+def _reverse_own_export_csv(df):
+    """Map this platform's own exported CSV (see format_export_data)
+    straight back onto OUTPUT_SCHEMA. Critically, 'Latitude'/'Longitude'
+    rename directly back to 'Lat'/'Long' so coordinates that were already
+    geocoded are preserved as-is and never re-sent to the geocoder --
+    that's the whole point of a loopback path."""
+    df = df.rename(columns={"Latitude": "Lat", "Longitude": "Long"})
+
+    # Reverse the single 'Status' text column back into the one-hot
+    # Ongoing/Completed/Terminated columns OUTPUT_SCHEMA expects.
+    # Anything that doesn't match a known label (including 'Unknown')
+    # stays NA on all three, which _assign_map_status already reads back
+    # out as 'Unknown' -- same convention the cost-list format uses.
+    for label in STATUS_LABELS:
+        df[label] = pd.NA
+    if "Status" in df.columns:
+        status_text = df["Status"].astype(str)
+        for label in STATUS_LABELS:
+            df.loc[status_text == label, label] = 1
+
+    df["Source Sheet"] = "CSV Re-import"
+
+    for col in OUTPUT_SCHEMA:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    df["Division"] = df["Division"].apply(normalize_division)
+    return df[OUTPUT_SCHEMA]
+
+
+def process_csv(uploaded_file):
+    """Task 9.6: native CSV ingestion, bypassing openpyxl/Excel structural
+    detection entirely.
+
+    If the CSV matches this platform's own export signature (Latitude /
+    Longitude / Status columns), it's a loopback re-upload and gets mapped
+    straight back onto OUTPUT_SCHEMA via _reverse_own_export_csv,
+    preserving any already-geocoded coordinates.
+
+    Otherwise it's treated as a generic flat, one-row-per-project CSV and
+    run through the exact same FIELD_ALIASES header mapping used for
+    Excel files, reusing parse_flat -- so there's no separate ingestion
+    codebase for CSVs, just a different entry point into the same
+    mapping/parsing logic.
+    """
+    file_bytes = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
+    df = pd.read_csv(io.BytesIO(file_bytes), dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if OWN_EXPORT_SIGNATURE_COLUMNS.issubset(set(df.columns)):
+        return _reverse_own_export_csv(df)
+
+    mapping = map_headers(list(df.columns))
+    if "Project Title" not in mapping:
+        return pd.DataFrame(columns=OUTPUT_SCHEMA)
+
+    unified = parse_flat(df, mapping, sheet_name="CSV Upload")
+    if unified.empty:
+        return unified
+
+    unified["Division"] = unified["Division"].apply(normalize_division)
+    return unified[OUTPUT_SCHEMA]
+
+
 def process_workbook(uploaded_file, sheet_filter=None):
     """Scan every visible sheet (or only those in sheet_filter), auto-detect
     each sheet's layout, and normalize everything to OUTPUT_SCHEMA. Hidden
@@ -512,7 +593,7 @@ def list_candidate_sheets(uploaded_file):
 
 @st.cache_data
 def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
-    """Ingest the workbook under the chosen mode and finish deriving the
+    """Ingest the file under the chosen mode and finish deriving the
     fields the rest of the app relies on (numeric Lat/Long, a single
     display status, a single effective funding figure).
 
@@ -523,20 +604,30 @@ def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
     has had a chance to fill gaps in. Rows without status simply display
     as 'Unknown'.
 
-    In Legacy Tracker mode, every CEST/LGIA/SSCP sheet is combined (they
-    are genuinely different divisions). In Cost List / Any Template mode,
-    only `selected_sheet` is loaded -- a workbook in this format is often
-    several dated snapshots of the *same* projects, not separate
-    divisions, so combining all sheets would multiply-count every project.
-    """
-    if ingestion_mode == "legacy":
-        sheet_filter = DATA_SHEETS
-    elif selected_sheet is not None:
-        sheet_filter = [selected_sheet]
-    else:
-        sheet_filter = None
+    CSV uploads (Task 9.6) go through process_csv, which bypasses the
+    Excel-oriented sheet/structure detection entirely -- either reversing
+    this platform's own export format straight back onto OUTPUT_SCHEMA
+    (preserving already-geocoded coordinates), or falling back to the
+    same generic flat-file parser Excel files use.
 
-    combined = process_workbook(uploaded_file, sheet_filter=sheet_filter)
+    For Excel uploads: in Legacy Tracker mode, every CEST/LGIA/SSCP sheet
+    is combined (they are genuinely different divisions). In Cost List /
+    Any Template mode, only `selected_sheet` is loaded -- a workbook in
+    this format is often several dated snapshots of the *same* projects,
+    not separate divisions, so combining all sheets would multiply-count
+    every project.
+    """
+    if ingestion_mode == "csv":
+        combined = process_csv(uploaded_file)
+    else:
+        if ingestion_mode == "legacy":
+            sheet_filter = DATA_SHEETS
+        elif selected_sheet is not None:
+            sheet_filter = [selected_sheet]
+        else:
+            sheet_filter = None
+
+        combined = process_workbook(uploaded_file, sheet_filter=sheet_filter)
 
     if combined.empty:
         return combined
@@ -545,6 +636,11 @@ def load_and_clean_data(uploaded_file, ingestion_mode, selected_sheet=None):
     combined["Long"] = pd.to_numeric(combined["Long"], errors="coerce")
     combined["Map_Status"] = combined.apply(_assign_map_status, axis=1)
     combined[EFFECTIVE_FUNDING_COL] = combined.apply(_compute_effective_funding, axis=1)
+
+    if "Coordinate_Source" not in combined.columns:
+        combined["Coordinate_Source"] = pd.NA
+    mask_original = combined["Lat"].notna() & combined["Long"].notna() & combined["Coordinate_Source"].isna()
+    combined.loc[mask_original, "Coordinate_Source"] = "Original"
 
     return combined
 
@@ -685,6 +781,7 @@ def resolve_missing_coordinates(df, api_token):
         if coords:
             df.at[idx, "Lat"] = coords[0]
             df.at[idx, "Long"] = coords[1]
+            df.at[idx, "Coordinate_Source"] = "Mapbox"
         else:
             failures.append({
                 "Project Title": row.get("Project Title", "Untitled"),
@@ -1235,6 +1332,11 @@ st.markdown("""
             align-self: flex-start !important; /* Anchor it to the top if it's a flex container */
         }
 
+        /* Force the map iframe inside the dialog to expand vertically to 85% of the screen */
+        div[data-testid="stDialog"] [role="dialog"] iframe {
+            height: 85vh !important;
+        }
+
     </style>
 """, unsafe_allow_html=True)
  
@@ -1314,6 +1416,73 @@ def show_project_details(clicked_projects):
     render_project_details_content(clicked_projects)
 
 
+@st.dialog("📍 Edit All Coordinates", width="large")
+def show_coordinate_editor(working_df):
+    """Provide a tabular interface to manually fix auto-generated or original coordinates."""
+    st.write("Edit the 'Lat' and 'Long' directly in the table below, or paste a 'Lat, Long' string into the 'Paste Coordinates' column.")
+    
+    if "Coordinate_Source" not in working_df.columns:
+        working_df["Coordinate_Source"] = pd.NA
+        
+    # Create an editable copy of the dataframe
+    edit_df = working_df[["Division", "Project Title", "Implementing Agency", "Location", "Coordinate_Source", "Lat", "Long"]].copy()
+    edit_df["Paste Coordinates"] = ""
+    
+    edited_df = st.data_editor(
+        edit_df,
+        disabled=["Division", "Project Title", "Implementing Agency", "Location", "Coordinate_Source"],
+        width='stretch',
+        hide_index=True,
+        key="coord_editor"
+    )
+    
+    if st.button("Save Changes", type="primary"):
+        changes_made = False
+        
+        for idx, row in edited_df.iterrows():
+            pasted = str(row.get("Paste Coordinates", "")).strip()
+            new_lat = row["Lat"]
+            new_lon = row["Long"]
+            updated = False
+            
+            # If they pasted a string, parse it
+            if pasted:
+                try:
+                    parts = pasted.strip("() ").split(",")
+                    if len(parts) == 2:
+                        new_lat = float(parts[0].strip())
+                        new_lon = float(parts[1].strip())
+                        updated = True
+                except Exception:
+                    st.error(f"Failed to parse pasted coordinates for '{row['Project Title']}'. Please use 'Lat, Long' format.")
+                    return
+            
+            original_lat = working_df.at[idx, "Lat"]
+            original_lon = working_df.at[idx, "Long"]
+            
+            # Safe comparison for float/NaN
+            def is_same(a, b):
+                if pd.isna(a) and pd.isna(b):
+                    return True
+                return a == b
+            
+            # If directly edited in the table
+            if not is_same(new_lat, original_lat) or not is_same(new_lon, original_lon):
+                updated = True
+                
+            if updated:
+                working_df.at[idx, "Lat"] = new_lat
+                working_df.at[idx, "Long"] = new_lon
+                working_df.at[idx, "Coordinate_Source"] = "Manual Override"
+                changes_made = True
+                
+        if changes_made:
+            st.session_state["working_df"] = working_df
+            st.success("Coordinates updated successfully!")
+            time.sleep(1) # Let the user see the success message
+            st.rerun()
+
+
 @st.dialog("📊 Raw Data Explorer", width="large")
 def show_raw_data(df):
     """Display the filtered dataset in a plain, sortable table."""
@@ -1328,8 +1497,8 @@ def show_fullscreen_map(df, pin_style, enable_clustering, show_legend, scale_by_
     map_key = f"fullscreen_map_{show_legend}_{enable_clustering}_{pin_style}_{scale_by_funding}"
     map_data = st_folium(
         project_map,
-        use_container_width=True,
-        height=570,
+        width='stretch',
+        height=800, # Fallback height, heavily overridden by the 85vh CSS above
         returned_objects=["last_object_clicked"],
         key=map_key
     )
@@ -1449,20 +1618,30 @@ data_format_label = st.sidebar.radio(
     options=list(INGESTION_MODES.keys()),
     index=0,
     help=(
-        "Select the option that matches your Excel file.\n\n"
-        "• Division-Based Template – For files organized into separate "
+        "Select the option that matches your data file.\n\n"
+        "• Division-Based Template – For Excel files organized into separate "
         "CEST, LGIA, and SSCP worksheets.\n\n"
         "• General Template – For project lists, project cost reports, "
         "and other supported DOST Excel templates. The application will "
         "automatically recognize the file format.\n\n"
+        "• Plain CSV Upload – For .csv files. If it's a file this app exported "
+        "earlier, its coordinates and data are read back in directly. Otherwise it's treated as a generic one-row-per-project file.\n\n"
         "Note: Only projects with valid coordinates can be displayed on the map."
     ),
 )
 ingestion_mode = INGESTION_MODES[data_format_label]
 
+if ingestion_mode == "csv":
+    file_type = ["csv"]
+    file_help = "Upload a .csv file."
+else:
+    file_type = ["xlsx"]
+    file_help = "Upload an Excel file (.xlsx)."
+
 uploaded_file = st.sidebar.file_uploader(
-    "Upload DOST-Davao Excel File (.xlsx)",
-    type=["xlsx"],
+    "Upload File",
+    type=file_type,
+    help=file_help,
 )
 
 selected_sheet = None
@@ -1509,7 +1688,7 @@ def format_export_data(df):
     current_cols = list(export_df.columns)
     
     # Pull out our target columns so we can safely reposition them
-    target_order = ["Status", "Remarks", "Latitude", "Longitude"]
+    target_order = ["Status", "Remarks", "Latitude", "Longitude", "Coordinate_Source"]
     for col in target_order:
         if col in current_cols:
             current_cols.remove(col)
@@ -1536,6 +1715,8 @@ def render_filters(clean_df, pin_style, enable_clustering, show_legend, scale_by
     """Render the sidebar filter controls and return the filtered DataFrame."""
     st.sidebar.header("🔍 Filter Dashboard")
 
+    search_query = st.sidebar.text_input("Search Project Title:", value="")
+
     available_divisions = clean_df["Division"].unique().tolist()
     selected_divisions = st.sidebar.multiselect(
         "Select Project(s):", available_divisions, default=available_divisions
@@ -1550,6 +1731,10 @@ def render_filters(clean_df, pin_style, enable_clustering, show_legend, scale_by
         clean_df["Division"].isin(selected_divisions)
         & clean_df["Map_Status"].isin(selected_statuses)
     ]
+
+    if search_query:
+        if "Project Title" in filtered_df.columns:
+            filtered_df = filtered_df[filtered_df["Project Title"].astype(str).str.contains(search_query, case=False, na=False)]
 
     if DATE_APPROVED_COL in clean_df.columns:
         approval_dates = pd.to_datetime(clean_df[DATE_APPROVED_COL], errors="coerce")
@@ -1961,6 +2146,7 @@ if uploaded_file is not None:
 
     working_df = st.session_state["working_df"]
     missing_coords_count = int((working_df["Lat"].isna() | working_df["Long"].isna()).sum())
+    st.sidebar.divider()
     st.sidebar.header("📍 Missing Coordinates")
     if missing_coords_count == 0:
         st.sidebar.caption("Every project has coordinates.")
@@ -2000,6 +2186,10 @@ if uploaded_file is not None:
                 "Implementing Agency text and re-run."
             )
 
+    st.sidebar.subheader("Coordinate Validation")
+    if st.sidebar.button("Edit All Coordinates", width="stretch"):
+        show_coordinate_editor(working_df)
+
     mappable_df = working_df.dropna(subset=["Lat", "Long"])
 
 
@@ -2035,7 +2225,7 @@ if uploaded_file is not None:
     map_key = f"main_map_{show_legend}_{enable_clustering}_{pin_style}_{scale_by_funding}"
     map_data = st_folium(
         project_map,
-        use_container_width=True,
+        width='stretch',
         height=460,
         returned_objects=["last_object_clicked"],
         key=map_key,
@@ -2045,7 +2235,7 @@ if uploaded_file is not None:
 
     col1, col2 = st.columns([0.85, 0.15])
     with col2:
-        if st.button("🔍 Maximize Map", use_container_width=True):
+        if st.button("🔍 Maximize Map", width="stretch"):
             show_fullscreen_map(filtered_df, pin_style, enable_clustering, show_legend, scale_by_funding)
 
     # (Removed original high-res export block from main body)
